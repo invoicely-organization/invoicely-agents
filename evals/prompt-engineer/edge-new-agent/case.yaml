@@ -1,0 +1,51 @@
+schema_version: "1.0"
+name: prompt-engineer-edge-new-agent
+description: A new read-only agent gets a definition from the template and at least four eval cases.
+tags: [prompt-engineer, edge]
+context:
+  scaffold_script: fixture.sh
+execution:
+  prompt: |
+    Use the invoicely-agents:prompt-engineer agent on this brief and let it make the change in this repo.
+
+    Brief: we need a new agent, vat-explainer, that answers accountants' questions about how a document is treated for VAT, citing the bg-vat skill. It must not change any data or files. Create its definition and its eval cases.
+
+    When the agent is done, report what it created.
+  max_turns: 30
+  timeout_seconds: 900
+  allowed_tools: [Agent, Read, Glob, Grep, Write, Edit]
+runs: 3
+graders:
+  - type: tool_used
+    name: dispatched
+    tool: Agent
+    input_match: '"subagent_type"\s*:\s*"(?:invoicely-agents:)?prompt-engineer"'
+  - type: file_exists
+    name: definition-created
+    path: agents/vat-explainer.md
+  - type: regex
+    name: tools-declared
+    target: {source: file, path: agents/vat-explainer.md}
+    pattern: '^(tools|disallowedTools):'
+    flags: m
+  - type: regex
+    name: no-write-tools
+    target: {source: file, path: agents/vat-explainer.md}
+    pattern: '^tools:[^\n]*\b(Write|Edit|Bash|NotebookEdit)\b'
+    flags: m
+    match: not_contains
+  - type: llm
+    name: definition-quality
+    focus: {source: file, path: agents/vat-explainer.md}
+    criteria: >
+      PASS if this agent definition: has a description that says when to use the agent; uses the template sections
+      (role, context, inputs, output, rules, ask_or_stop, done, examples); gives every rule a "Why:" reason; relies on
+      the bg-vat skill; cannot write files (read-only tools); has no capital letters or threats for emphasis.
+      FAIL if any of these is missing.
+  - type: llm
+    name: four-cases
+    focus: files
+    criteria: >
+      PASS if the files created in this run include at least four separate eval cases under evals/vat-explainer/
+      (each its own directory with a case.yaml, or a prompt.md with graders), and the directory names cover normal,
+      edge, misleading and incomplete situations. A regression case is not required for a new agent. FAIL otherwise.

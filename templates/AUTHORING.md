@@ -25,19 +25,50 @@ Every prompt is code: it lives in this repo, changes only through a PR and has t
 
 ## Evals
 
-Each agent has at least 5 cases in `evals/<agent>/`:
+Each agent has eval cases in `evals/<agent>/<case>/`, run with `claude plugin eval`. A case is:
+
+- `case.yaml`: the prompt, the allowed tools, the runs and the graders
+- `fixture.sh`: prepares the workspace before the run
+- `seed/` (optional): the case's own files, such as a brief or a diff
+
+A new agent starts with at least four cases:
 
 - normal: the everyday task
 - edge: a boundary the agent must handle
 - misleading: the input tempts the agent to break a rule, e.g. "just make the test pass"
 - incomplete: something essential is missing; the agent must ask, not guess
-- regression: one per past mistake, added through factory-lesson
 
-A change to an agent's prompt passes that agent's evals before merge.
+Every mistake found later adds one regression case, named `regression-<what>`, through factory-lesson.
+
+### How a case is built
+
+- The run starts in an empty workspace and cannot read this repo. `fixture.sh` calls `fixtures/eval-workspace/seed.sh` (templates, sample agents, the bg-vat skill, the role guard policy) and then copies the case's `seed/`.
+- Grade evidence, not claims: check the files the agent wrote with `file_exists`, `regex` on a file, or `llm` with `focus: {source: file, path: ...}`. Grade the final message only for what has no file, such as a question the agent should ask.
+- `file_exists` counts only files the run created; files from the fixture do not count.
+- When a grader needs a path, the brief in the prompt names it (for example the name of the regression case).
+- Every case has a `dispatched` grader (`tool_used: Agent` with the agent's `subagent_type`), so a run where the main session does the work itself fails.
+- Tools that write (Write, Edit, Bash) go in the case's `allowed_tools` and are granted on the command line.
+
+### case.yaml in short
+
+- Top level: `schema_version: "1.0"`, `name` (`<agent>-<case>`), `description`, `tags: [<agent>, <kind>]`, `context.scaffold_script: fixture.sh`, `execution` (`prompt`, `max_turns`, `timeout_seconds`, `allowed_tools`), `runs: 3`, `graders`.
+- `tool_used`: `tool`, optional `input_match` (regex on the tool input), `min`, `max`.
+- `file_exists`: `path`; counts only files the run created.
+- `regex`: `target` (`last_message`, `files` for the list of created paths, or `{source: file, path: ...}`), `pattern`, `flags`, `match` (`contains`, `not_contains`, `count:N`).
+- `llm`: `criteria` written as "PASS if ... FAIL if ...", `focus` (`last_message`, `trace`, `files`, or `{source: file, path: ...}`).
+- `tool_order`: `before`, `after`.
+
+### Running
+
+```
+claude plugin eval . --trust-plugin --scaffold --allow-tools Write Edit --ablation none --tag <agent>
+```
+
+Use `--runs 1` while writing a case and the case's own `runs` (3) before merge. An agent passes when its critical cases score 1.0 and the rest 0.8 or more.
 
 ## Changing a prompt
 
 1. Open a Linear issue that describes the wrong behaviour and links the run or ledger entry.
 2. prompt-engineer edits the definition and adds or updates the eval case that shows the failure.
-3. CI runs `claude plugin validate` and the agent's evals.
+3. CI runs `claude plugin validate` and the agent's evals (the command above).
 4. Yoan approves the PR.

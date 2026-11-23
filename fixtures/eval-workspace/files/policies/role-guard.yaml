@@ -1,0 +1,17 @@
+# The paths each agent may write, as globs relative to the product repo.
+# The role guard hook (PreToolUse on Write, Edit and Bash) refuses a write outside
+# "allow" or inside "deny" for the agent that makes it.
+# Change this file through a PR like any prompt; Yoan approves.
+reviewer:
+  allow: []
+test-author:
+  allow: ["**/*.test.ts", "**/*.test.tsx", "e2e/**"]
+backend-engineer:
+  allow: ["apps/api/**", "packages/db/**"]
+  deny: ["**/*.test.ts", "fixtures/etalons/**"]
+domain-engineer:
+  allow: ["packages/domain/**"]
+  deny: ["**/*.test.ts", "fixtures/etalons/**"]
+frontend-engineer:
+  allow: ["apps/web/**"]
+  deny: ["fixtures/etalons/**"]
