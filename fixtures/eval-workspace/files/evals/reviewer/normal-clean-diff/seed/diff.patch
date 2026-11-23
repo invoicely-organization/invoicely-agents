@@ -1,0 +1,10 @@
+--- a/apps/web/src/features/vat/components/vat-summary-card.tsx
++++ b/apps/web/src/features/vat/components/vat-summary-card.tsx
+@@ -8,6 +8,7 @@ export function VatSummaryCard({ summary }: Props) {
+   return (
+     <Card>
+       <CardTitle>{texts.vatDue}</CardTitle>
++      <MoneyCell amountCents={summary.vatDueCents} currency="EUR" />
+     </Card>
+   );
+ }

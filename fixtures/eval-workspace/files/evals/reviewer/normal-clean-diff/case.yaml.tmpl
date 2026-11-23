@@ -1,0 +1,22 @@
+schema_version: "1.0"
+name: reviewer-normal-clean-diff
+description: A correct diff that meets every criterion gets PASS.
+tags: [reviewer, normal]
+context:
+  scaffold_script: fixture.sh
+execution:
+  prompt: |
+    Use the invoicely-agents:reviewer agent. Review diff.patch against brief.md and report its verdict.
+  max_turns: 20
+  timeout_seconds: 600
+  allowed_tools: [Agent, Read, Glob, Grep]
+runs: 3
+graders:
+  - type: tool_used
+    name: dispatched
+    tool: Agent
+    input_match: '"subagent_type"\s*:\s*"(?:invoicely-agents:)?reviewer"'
+  - type: regex
+    name: verdict-pass
+    target: last_message
+    pattern: '\bPASS\b'

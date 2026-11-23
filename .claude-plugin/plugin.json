@@ -1,0 +1,6 @@
+{
+  "name": "invoicely-agents",
+  "version": "0.1.0",
+  "description": "The agents, domain skills and templates that build Invoicely, with their evals.",
+  "author": { "name": "Future X" }
+}

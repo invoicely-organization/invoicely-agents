@@ -1,0 +1,8 @@
+# The paths each agent may write, as globs relative to the product repo.
+# The role guard hook (PreToolUse on Write, Edit and Bash, INV-14) refuses a write
+# outside "allow" or inside "deny" for the agent that makes it. The hook knows the
+# agent from the agent_type field of the hook input.
+# Each agent gets its entry when its definition is added (INV-10, INV-17).
+# Change this file through a PR like any prompt; Yoan approves.
+prompt-engineer:
+  allow: []

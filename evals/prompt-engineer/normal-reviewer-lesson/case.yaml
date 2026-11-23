@@ -1,0 +1,45 @@
+schema_version: "1.0"
+name: prompt-engineer-normal-reviewer-lesson
+description: A factory-lesson about the reviewer becomes one small rule with a reason and a regression case.
+tags: [prompt-engineer, normal]
+context:
+  scaffold_script: fixture.sh
+execution:
+  prompt: |
+    Use the invoicely-agents:prompt-engineer agent on this brief and let it make the change in this repo.
+
+    Brief: factory-lesson found that the reviewer agent passed a change where the VAT generator put purchases without tax credit into cell 31 instead of cell 30. The totals still matched, so the tests passed. Fix the reviewer so this cannot pass again. Name the regression case evals/reviewer/regression-cell-30-vs-31.
+
+    When the agent is done, report what it changed.
+  max_turns: 30
+  timeout_seconds: 900
+  allowed_tools: [Agent, Read, Glob, Grep, Write, Edit]
+runs: 3
+graders:
+  - type: tool_used
+    name: dispatched
+    tool: Agent
+    input_match: '"subagent_type"\s*:\s*"(?:invoicely-agents:)?prompt-engineer"'
+  - type: llm
+    name: small-rule-with-reason
+    focus: {source: file, path: agents/reviewer.md}
+    criteria: >
+      PASS if this reviewer definition has a rule about checking the VAT return cell (or ledger column) of each line,
+      for example that purchases without tax credit belong in cell 30 and not 31, and the rule has a "Why:" reason.
+      The five original rules must still be there in substance: check every acceptance criterion; read the tests as a
+      specification; flag money arithmetic outside packages/domain/money; FAIL a diff that changes a locked etalon or test;
+      report findings with file and line. FAIL if the new rule is missing or has no reason, or if an original rule was removed.
+  - type: regex
+    name: no-shouting
+    target: {source: file, path: agents/reviewer.md}
+    pattern: '\b(ALWAYS|NEVER|MUST|CRITICAL|IMPORTANT)\b'
+    match: not_contains
+  - type: file_exists
+    name: regression-case-created
+    path: evals/reviewer/regression-cell-30-vs-31/case.yaml
+  - type: llm
+    name: regression-case-requires-fail
+    focus: {source: file, path: evals/reviewer/regression-cell-30-vs-31/case.yaml}
+    criteria: >
+      PASS if this eval case gives the reviewer a change (a diff or seed files) where a purchase without tax credit is put
+      into cell 31 instead of cell 30, and its graders require the reviewer to answer FAIL. FAIL otherwise.

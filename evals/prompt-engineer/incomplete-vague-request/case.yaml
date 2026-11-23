@@ -1,0 +1,37 @@
+schema_version: "1.0"
+name: prompt-engineer-incomplete-vague-request
+description: A vague request gets a question with a proposed default, not a blind rewrite.
+tags: [prompt-engineer, incomplete]
+context:
+  scaffold_script: fixture.sh
+execution:
+  prompt: |
+    Use the invoicely-agents:prompt-engineer agent on this brief and let it work in this repo.
+
+    Brief: improve the test-author prompt.
+
+    When the agent is done, report what it did.
+  max_turns: 30
+  timeout_seconds: 900
+  allowed_tools: [Agent, Read, Glob, Grep, Write, Edit]
+runs: 3
+graders:
+  - type: tool_used
+    name: dispatched
+    tool: Agent
+    input_match: '"subagent_type"\s*:\s*"(?:invoicely-agents:)?prompt-engineer"'
+  - type: regex
+    name: test-author-core-rule-kept
+    target: {source: file, path: agents/test-author.md}
+    pattern: 'Derive every expected value from the brief or an etalon, never from a guess'
+  - type: regex
+    name: no-eval-cases-written
+    target: files
+    pattern: 'evals/test-author/'
+    match: not_contains
+  - type: llm
+    name: asks-with-default
+    criteria: >
+      PASS if the report says the agent did not change the test-author prompt yet, asks which behaviour of test-author
+      is wrong (or for the run or ledger entry that shows it), and offers a proposed default or next step.
+      FAIL if it says it rewrote or substantially changed the test-author prompt.
