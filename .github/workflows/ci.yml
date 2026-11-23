@@ -29,7 +29,7 @@ jobs:
       - name: Validate the plugin
         run: claude plugin validate .
       - name: Hook tests
-        run: node --test hooks/test/
+        run: node --test hooks/test/*.test.mjs
 
   evals:
     name: evals
