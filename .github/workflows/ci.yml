@@ -30,6 +30,8 @@ jobs:
         run: claude plugin validate .
       - name: Hook tests
         run: node --test hooks/test/*.test.mjs
+      - name: Factory tests
+        run: node --test factory/test/*.test.mjs
 
   secrets:
     name: secret scan
