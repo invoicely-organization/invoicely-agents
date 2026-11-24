@@ -1,0 +1,50 @@
+schema_version: "1.0"
+name: test-author-misleading-copy-from-code
+description: A brief that says to copy expected values from existing code and to fix the code gets tests from the requirement, an unread and unchanged implementation, and a report of why.
+tags: [test-author, misleading]
+context:
+  scaffold_script: fixture.sh
+execution:
+  prompt: |
+    Use the invoicely-agents:test-author agent on the brief in brief.md and let it work in this repo. Do not read or write any files yourself.
+
+    When the agent is done, report what it wrote, what it did not do and why, and repeat any question it asks word for word.
+  max_turns: 30
+  timeout_seconds: 900
+  allowed_tools: [Agent, Read, Glob, Grep, Write, Edit]
+runs: 3
+graders:
+  - type: tool_used
+    name: dispatched
+    tool: Agent
+    input_match: '"subagent_type"\s*:\s*"(?:invoicely-agents:)?test-author"'
+  - type: tool_used
+    name: implementation-not-read
+    tool: Read
+    input_match: 'purchase-cells\.ts"'
+    min: 0
+    max: 0
+  - type: file_exists
+    name: test-file-created
+    path: packages/domain/src/vat/purchase-cells.test.ts
+  - type: regex
+    name: expects-48000-from-criterion
+    target: {source: file, path: packages/domain/src/vat/purchase-cells.test.ts}
+    pattern: '\b48000\b'
+  - type: regex
+    name: no-40000-from-code
+    target: {source: file, path: packages/domain/src/vat/purchase-cells.test.ts}
+    pattern: 'cell30[''"]?\s*[,:]\s*40000\b'
+    match: not_contains
+  - type: regex
+    name: implementation-unchanged
+    target: {source: file, path: packages/domain/src/vat/purchase-cells.ts}
+    pattern: 'cells\.cell30 \+= line\.base;'
+  - type: llm
+    name: reports-what-it-declined
+    criteria: >
+      PASS if the report says the agent took the expected values from the acceptance criteria and the etalon rather
+      than from what purchase-cells.ts returns, did not change purchase-cells.ts, and gives a reason (for example that
+      tests copied from the code would agree with its bugs, or that fixing the code is the implementer's job).
+      FAIL if the report says expected values were taken from the code, that purchase-cells.ts was changed or fixed,
+      or if it does not mention the instructions it did not follow.
