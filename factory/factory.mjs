@@ -19,7 +19,8 @@ import { fileURLToPath } from 'node:url';
 import { appSettings, installationToken, sessionEnv, writeGhConfig } from './github-app.mjs';
 import {
   blockingDeps, checksVerdict, classify, failedChecks, fillTemplate, findPrUrl, fixMessage, inWindow, isFeatureBranch,
-  minutesBetween, nextRunnable, nextWindowStart, parseLimitReset, parseResult, sessionDirName,
+  minutesBetween, nextRunnable, nextWindowStart, nightReport, nightStart, parseLimitReset, parseResult, sessionBudget,
+  sessionDirName, spentSince,
 } from './lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -33,6 +34,8 @@ const config = {
   windowStart: 22,
   windowEnd: 8,
   nodeBin: '',
+  nightBudgetUsd: 60, // API dollars a night may spend on sessions and CI evals; then the runner stops until the next night
+  reportProjectId: 'a2abfb0c-4d55-41a7-8719-3838050c6d0c', // Linear project "M0 Инфраструктура": the night report goes there
   ...readJson(path.join(STATE, 'config.json'), {}),
 };
 const QUEUE = path.join(STATE, 'queue.json');
@@ -298,14 +301,14 @@ function runClaude(args, cwd, logFile, identity) {
   });
 }
 
-async function runTask(task) {
+async function runTask(task, budgetCap) {
   const unlock = lock(task.issue);
   try {
     const runtime = ensureRuntime();
     const prBase = task.base || 'main';
     ensureBase(prBase);
     const wt = ensureWorktree(task.branch, prBase);
-    const budget = task.budgetUsd ?? config.budgetUsd;
+    const budget = Math.min(task.budgetUsd ?? config.budgetUsd, budgetCap ?? Infinity);
     const base = ['--plugin-dir', runtime, '--permission-mode', 'acceptEdits', '--output-format', 'json',
       '--max-budget-usd', String(budget), ...(task.addDir ? ['--add-dir', task.addDir] : []), '--allowedTools', ...ALLOWED_TOOLS];
     let args;
@@ -371,6 +374,60 @@ function ledger(entry) {
   fs.appendFileSync(LEDGER, `${JSON.stringify(entry)}\n`);
 }
 
+function readLedger() {
+  if (!fs.existsSync(LEDGER)) return [];
+  return fs.readFileSync(LEDGER, 'utf8').split('\n').filter(Boolean).flatMap((line) => {
+    try {
+      return [JSON.parse(line)];
+    } catch {
+      return [];
+    }
+  });
+}
+
+// The evals CI ran on a PR spend the same Max limit, so their cost goes into the ledger as well (once per CI run).
+async function recordCiEvals(item) {
+  try {
+    const runs = await gh(['run', 'list', '--branch', item.branch, '--event', 'pull_request', '--status', 'completed', '--limit', '1', '--json', 'databaseId'], { json: true });
+    const runId = runs[0]?.databaseId;
+    if (!runId || readLedger().some((e) => e.status === 'ci-evals' && e.runId === runId)) return;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ci-evals-'));
+    try {
+      await gh(['run', 'download', String(runId), '-n', 'eval-results', '-D', dir]);
+    } catch {
+      return; // no evals in this run: no agent changed
+    } finally {
+      setTimeout(() => fs.rmSync(dir, { recursive: true, force: true }), 60 * 1000).unref();
+    }
+    const script = path.join(ensureRuntime(), 'scripts', 'eval-cost.mjs');
+    const cost = JSON.parse(execFileSync(process.execPath, [script, dir, '--json']).toString());
+    ledger({ issue: item.issue, branch: item.branch, base: item.base, pr: item.pr, runId, ended: new Date().toISOString(), status: 'ci-evals', costUsd: cost.totalUsd, cases: cost.cases.length });
+    log(`${item.issue}: CI evals cost $${cost.totalUsd} (run ${runId})`);
+  } catch (error) {
+    log(`${item.issue}: CI evals cost unknown: ${error.message}`);
+  }
+}
+
+// One report per night, as an update of the Linear project, when the night is over or the queue is empty.
+async function reportNight(reason) {
+  const since = nightStart(new Date(), config.windowStart);
+  const stateFile = path.join(STATE, 'reports.json');
+  const state = readJson(stateFile, { nights: [] });
+  if (state.nights.includes(since.toISOString())) return;
+  const entries = readLedger();
+  if (!entries.some((e) => e.ended && Date.parse(e.ended) >= since.getTime())) return;
+  const body = `${nightReport(entries, since, config.nightBudgetUsd)}\n\n${reason}`;
+  try {
+    const ok = await linear('mutation($p:String!,$b:String!){projectUpdateCreate(input:{projectId:$p,body:$b}){success}}', { p: config.reportProjectId, b: body });
+    if (ok === null) log('night report: no LINEAR_API_KEY, report only in the log');
+  } catch (error) {
+    log(`night report: ${error.message}`);
+  }
+  log(`night report\n${body}`);
+  state.nights = [...state.nights.slice(-30), since.toISOString()];
+  fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+}
+
 // Change one queue item by its task id; null removes it. The queue file is re-read, so edits made meanwhile stay.
 function updateItem(issue, change) {
   const queue = readJson(QUEUE, []);
@@ -399,6 +456,7 @@ async function processCi() {
       if (minutesBetween(new Date(item.ciSince), new Date()) < CI_TIMEOUT_MINUTES) continue;
       result = { verdict: 'timeout', failed: [`CI did not finish in ${CI_TIMEOUT_MINUTES} minutes`] };
     }
+    await recordCiEvals(item);
     if (result.verdict === 'merged' || result.verdict === 'closed') {
       const entry = { ...done, status: result.verdict };
       ledger(entry);
@@ -448,18 +506,35 @@ async function runQueue(now) {
   for (;;) {
     await processCi();
     let queue = readJson(QUEUE, []);
-    if (queue.length === 0) return log('queue empty');
+    if (queue.length === 0) {
+      await reportNight('Опашката е празна.');
+      return log('queue empty');
+    }
     const merged = await mergedByBase(queue);
     await dropBlocked(queue, merged);
     queue = readJson(QUEUE, []);
     const waitingForCi = queue.some((t) => t.stage === 'ci');
     const task = nextRunnable(queue, merged);
     if (!task) {
-      if (!waitingForCi) return log('nothing can run: every task waits for a dependency');
+      if (!waitingForCi) {
+        await reportNight('Нищо не може да тръгне: всяка задача чака зависимост.');
+        return log('nothing can run: every task waits for a dependency');
+      }
       await sleep(2 * 60 * 1000);
       continue;
     }
     if (!now && !inWindow(new Date(), config.windowStart, config.windowEnd)) {
+      await reportNight(`Нощта свърши. В опашката остават: ${queue.map((t) => `${t.issue}${t.stage === 'ci' ? ' (чака CI)' : ''}`).join(', ')}.`);
+      const start = nextWindowStart(new Date(), config.windowStart);
+      if (waitingForCi) await sleep(Math.min(5 * 60 * 1000, start - Date.now()));
+      else await sleepUntil(start);
+      continue;
+    }
+    // The night cap: sessions and CI evals together; a session never gets more than what is left of the night.
+    const spent = spentSince(readLedger(), nightStart(new Date(), config.windowStart));
+    const budgetCap = sessionBudget(task.budgetUsd ?? config.budgetUsd, config.nightBudgetUsd, spent);
+    if (!now && budgetCap === 0) {
+      log(`night cap reached: $${spent.toFixed(2)} of $${config.nightBudgetUsd}; no new session until the next night`);
       const start = nextWindowStart(new Date(), config.windowStart);
       if (waitingForCi) await sleep(Math.min(5 * 60 * 1000, start - Date.now()));
       else await sleepUntil(start);
@@ -467,7 +542,7 @@ async function runQueue(now) {
     }
     let result;
     try {
-      result = await runTask(task);
+      result = await runTask(task, now ? undefined : budgetCap);
     } catch (error) {
       log(`${task.issue}: could not run: ${error.message}`);
       ledger({ issue: task.issue, branch: task.branch, ended: new Date().toISOString(), status: 'error', error: error.message });
@@ -501,6 +576,8 @@ async function main() {
     console.log('locks:', fs.readdirSync(path.join(STATE, 'locks')).join(', ') || 'none');
     const app = appSettings(STATE);
     console.log('github:', app ? `${app.slug}[bot] (App ${app.appId}, installation ${app.installationId})` : 'Yoan (no GitHub App in config.json)');
+    const since = nightStart(new Date(), config.windowStart);
+    console.log(`night since ${since.toLocaleString()}: $${spentSince(readLedger(), since).toFixed(2)} of $${config.nightBudgetUsd}`);
     const runs = fs.existsSync(LEDGER) ? fs.readFileSync(LEDGER, 'utf8').trim().split('\n').slice(-10) : [];
     console.log('last runs:');
     for (const line of runs) {
