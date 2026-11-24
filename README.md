@@ -14,6 +14,8 @@ The agents, domain skills, templates and evals that build Invoicely. The product
 
 - CI (`.github/workflows/ci.yml`): `claude plugin validate` and the hook tests on every PR; the evals of the changed agents when the `CLAUDE_CODE_OAUTH_TOKEN` secret is set; the whole eval suite every Monday
 
+- `factory/`: the runner for agent sessions on the Mac (`node factory/factory.mjs`). One queue, one session per task, a spending cap per run (`--max-budget-usd`), a night window (22:00 to 08:00) unless `--now`, automatic resume after the usage limit resets, a run ledger in `~/.invoicely/ledger/runs.jsonl` and a summary comment in Linear when `LINEAR_API_KEY` is in `~/.invoicely/.env`. The plugin loads from a separate copy (`plugin-runtime`), because Claude Code refuses edits to a loaded plugin's files. Tests: `node --test factory/test/*.test.mjs`
+
 ## Rules
 
 - Changes only through a PR: prompt-engineer writes, the evals pass, Yoan approves.
