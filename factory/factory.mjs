@@ -3,7 +3,7 @@
 // one session per task, a night window, and automatic resume after the usage limit resets.
 // Ideas taken from Paperclip (budgets, heartbeats, atomic checkout, audit log).
 //
-//   factory queue add <INV-xx> --branch <b> --brief <file> [--answers <file>] [--budget <usd>]
+//   factory queue add <INV-xx> --branch <b> --brief <file> [--answers <file>] [--budget <usd>] [--add-dir <dir>]
 //                              [--resume-session <id> --message <text>]
 //   factory queue run [--now]     run the queue, one task at a time, in the night window unless --now
 //   factory run <INV-xx> ...      run one task now (same options as queue add)
@@ -182,7 +182,7 @@ async function runTask(task) {
     const wt = ensureWorktree(task.branch);
     const budget = task.budgetUsd ?? config.budgetUsd;
     const base = ['--plugin-dir', runtime, '--permission-mode', 'acceptEdits', '--output-format', 'json',
-      '--max-budget-usd', String(budget), '--allowedTools', ...ALLOWED_TOOLS];
+      '--max-budget-usd', String(budget), ...(task.addDir ? ['--add-dir', task.addDir] : []), '--allowedTools', ...ALLOWED_TOOLS];
     let args;
     if (task.resumeSession) {
       const message = task.message || 'You stopped before finishing (usage limit or interruption). Continue exactly where you stopped and finish the same instructions.';
@@ -222,7 +222,7 @@ function parseTask(argv) {
   if (!/^INV-\d+$/.test(issue ?? '')) throw new Error('first argument must be a task id such as INV-31');
   const task = { issue };
   for (let i = 0; i < rest.length; i += 2) {
-    const key = { '--branch': 'branch', '--brief': 'brief', '--answers': 'answers', '--budget': 'budgetUsd', '--resume-session': 'resumeSession', '--message': 'message' }[rest[i]];
+    const key = { '--branch': 'branch', '--brief': 'brief', '--answers': 'answers', '--budget': 'budgetUsd', '--resume-session': 'resumeSession', '--message': 'message', '--add-dir': 'addDir' }[rest[i]];
     if (!key) throw new Error(`unknown option ${rest[i]}`);
     task[key] = key === 'budgetUsd' ? Number(rest[i + 1]) : rest[i + 1];
   }
