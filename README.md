@@ -10,7 +10,7 @@ The agents, domain skills, templates and evals that build Invoicely. The product
 - `evals/`: eval cases per agent, run with `claude plugin eval` (see `templates/AUTHORING.md`)
 - `fixtures/eval-workspace/`: the workspace every eval case starts from
 - `policies/role-guard.yaml`: the paths each agent may write; the role guard hook enforces it
-- `hooks/`: guards that run wherever the plugin is enabled. The role guard lets a subagent write only its paths from `policies/role-guard.yaml`. The main guard stops a push to main, force push, `--no-verify`, merging or approving a PR and changes to branch protection, for agents and the main session alike. Tests: `node --test hooks/test/*.test.mjs`
+- `hooks/`: guards that run wherever the plugin is enabled. The role guard lets a subagent write only its paths from `policies/role-guard.yaml`: through Write and Edit it is stopped before the write, through Bash it cannot finish until it puts the files back (SubagentStop). Two subagents working at the same time in one working copy cannot be told apart, so agents that write code run in separate worktrees. The main guard stops a push to main, force push, `--no-verify`, merging or approving a PR and changes to branch protection, for agents and the main session alike. Tests: `node --test hooks/test/*.test.mjs`
 
 - CI (`.github/workflows/ci.yml`): `claude plugin validate` and the hook tests on every PR; the evals of the changed agents when the `CLAUDE_CODE_OAUTH_TOKEN` secret is set; the whole eval suite every Monday
 
