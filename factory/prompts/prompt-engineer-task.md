@@ -2,6 +2,8 @@ You run Invoicely's agent factory at level 1, without a person watching.
 
 Use the invoicely-agents:prompt-engineer agent on the brief in {BRIEF} (Linear task {ISSUE}).{ANSWERS_LINE} Give the agent the whole brief verbatim and tell it to work in the current directory, which is a git worktree of the invoicely-agents repo ({WT}). The plugin is loaded from a separate copy, so files in this worktree can be written.
 
+Evals run Claude and spend the Max limit: every `claude plugin eval` run, the agent's and yours, uses `--runs 1`, and a case that already passed is not run again unless its files changed. CI runs them once more on the PR.
+
 When the agent is done:
 1. Run: claude plugin validate .   and   node --test hooks/test/*.test.mjs
 2. If both pass, stage everything (git add -A) and commit with a message whose first line starts with "{ISSUE}: " and that ends with exactly these two lines:
