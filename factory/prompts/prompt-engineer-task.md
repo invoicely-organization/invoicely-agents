@@ -8,10 +8,10 @@ When the agent is done:
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01DZpbhHzUVWiPy1aPcyVq5Y
 3. git push -u origin {BRANCH}
-4. gh pr create --base main --head {BRANCH} with a title that starts with "{ISSUE}: " and a body that is the agent's Bulgarian PR description, then a line "Linear: {ISSUE}", then a blank line and these two lines:
+4. gh pr create --base {BASE} --head {BRANCH} with a title that starts with "{ISSUE}: " and a body that is the agent's Bulgarian PR description, then a line "Linear: {ISSUE}", then a blank line and these two lines:
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 https://claude.ai/code/session_01DZpbhHzUVWiPy1aPcyVq5Y
-Never merge and never push to main.
+Never merge and never push to main or to a feature/ branch: the runner merges when CI is green.
 
 If the agent stops with a question instead of finishing, do not commit; end with the question and the agent's proposed answer.
 End with: the PR URL (or the open question), the eval results per case, and the files changed.
