@@ -67,3 +67,46 @@ export function parseResult(stdout) {
 export function minutesBetween(start, end) {
   return Math.round((end - start) / 60000);
 }
+
+// --- Feature branches (INV-43): every subtask PR goes to feature/INV-xx and is merged there when CI is green.
+
+export function isFeatureBranch(base) {
+  return /^feature\//.test(base ?? '');
+}
+
+// `gh pr checks --json name,bucket` gives pass, fail, pending, skipping or cancel per check.
+// No checks yet counts as pending: the workflow may not have started.
+export function checksVerdict(checks) {
+  if (!Array.isArray(checks) || checks.length === 0) return 'pending';
+  if (checks.some((c) => c.bucket === 'fail' || c.bucket === 'cancel')) return 'fail';
+  if (checks.some((c) => c.bucket === 'pending')) return 'pending';
+  return 'pass';
+}
+
+export function failedChecks(checks) {
+  return (checks ?? []).filter((c) => c.bucket === 'fail' || c.bucket === 'cancel').map((c) => c.name);
+}
+
+// A task may run when every task it depends on is merged into its base.
+export function blockingDeps(task, merged) {
+  return (task.dependsOn ?? []).filter((dep) => !merged.has(dep));
+}
+
+export function fixMessage({ pr, failed, branch, base }) {
+  const conflict = failed.some((f) => f.startsWith('merge conflict'));
+  return [
+    `CI failed on your PR ${pr}: ${failed.join(', ') || 'a required check'}.`,
+    conflict
+      ? `Another task was merged into ${base} first. Run git fetch origin and git merge origin/${base}, resolve the conflicts so that both sides' changes stay (for example both agents' entries in policies/role-guard.yaml), and do not drop the other task's work.`
+      : `See why with: gh pr checks ${pr}   and   gh run view <run id> --log-failed`,
+    `Fix it in this worktree, run the checks from your instructions again, then commit and git push to ${branch}.`,
+    'Do not open a new PR and do not change the PR base.',
+    `End with what you changed, the check results and the PR URL: ${pr}`,
+  ].join('\n');
+}
+
+// Pick the next task to run: the first one that is not waiting for CI and whose dependencies are merged
+// into its own base. mergedByBase maps a base branch to the set of task ids merged into it.
+export function nextRunnable(queue, mergedByBase) {
+  return queue.find((t) => t.stage !== 'ci' && blockingDeps(t, mergedByBase.get(t.base || 'main') ?? new Set()).length === 0) ?? null;
+}

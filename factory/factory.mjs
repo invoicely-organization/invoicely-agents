@@ -17,7 +17,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { appSettings, installationToken, sessionEnv, writeGhConfig } from './github-app.mjs';
-import { classify, fillTemplate, findPrUrl, inWindow, minutesBetween, nextWindowStart, parseLimitReset, parseResult, sessionDirName } from './lib.mjs';
+import {
+  blockingDeps, checksVerdict, classify, failedChecks, fillTemplate, findPrUrl, fixMessage, inWindow, isFeatureBranch,
+  minutesBetween, nextRunnable, nextWindowStart, parseLimitReset, parseResult, sessionDirName,
+} from './lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOME = os.homedir();
@@ -40,7 +43,8 @@ const ALLOWED_TOOLS = [
   'Agent', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
   'Bash(claude plugin validate:*)', 'Bash(claude plugin eval:*)', 'Bash(node --test:*)', 'Bash(node:*)',
   'Bash(git status:*)', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git add:*)', 'Bash(git commit:*)', 'Bash(git push:*)',
-  'Bash(gh pr create:*)', 'Bash(gh pr view:*)', 'Bash(ls:*)', 'Bash(mkdir:*)', 'Bash(chmod:*)', 'Bash(cat:*)',
+  'Bash(gh pr create:*)', 'Bash(gh pr view:*)', 'Bash(gh pr checks:*)', 'Bash(gh run view:*)', 'Bash(gh run list:*)',
+  'Bash(git fetch:*)', 'Bash(git merge:*)', 'Bash(ls:*)', 'Bash(mkdir:*)', 'Bash(chmod:*)', 'Bash(cat:*)',
 ];
 
 function readJson(file, fallback) {
@@ -78,16 +82,96 @@ function ensureRuntime() {
   return runtime;
 }
 
-function ensureWorktree(branch) {
+// A new task branch starts from its base as it is now: for a subtask, the feature branch with every merged subtask.
+function ensureWorktree(branch, base = 'main') {
   const wt = path.join(config.worktrees, branch);
   if (fs.existsSync(wt)) return wt;
   git(config.repo, ['fetch', '-q', 'origin']);
   try {
     git(config.repo, ['worktree', 'add', '-q', wt, branch]);
   } catch {
-    git(config.repo, ['worktree', 'add', '-q', '-b', branch, wt, 'origin/main']);
+    git(config.repo, ['worktree', 'add', '-q', '-b', branch, wt, `origin/${base}`]);
   }
   return wt;
+}
+
+// --- Feature branches (INV-43) ---
+
+// gh for the runner itself; asBot runs it as the GitHub App bot (merges), otherwise as Yoan (reads).
+async function gh(args, { asBot = false, json = false } = {}) {
+  let env = { ...process.env };
+  if (asBot) {
+    const app = appSettings(STATE);
+    if (app) {
+      const ghConfigDir = path.join(STATE, 'gh-bot');
+      writeGhConfig(ghConfigDir, await installationToken(app), app.slug);
+      env = sessionEnv(env, { slug: app.slug, botUserId: app.botUserId, ghConfigDir, helperCommand: '' });
+    }
+  }
+  let out;
+  try {
+    out = execFileSync('gh', args, { cwd: config.repo, env, stdio: ['ignore', 'pipe', 'pipe'] }).toString();
+  } catch (error) {
+    // gh pr checks exits with 8 while checks run and 1 when one failed, and still prints the JSON.
+    out = error.stdout?.toString() ?? '';
+    if (!json || !out.trim()) throw new Error(`gh ${args.join(' ')}: ${(error.stderr?.toString() || error.message).trim().slice(0, 300)}`);
+  }
+  return json ? JSON.parse(out) : out.trim();
+}
+
+function ensureBase(base) {
+  if (!isFeatureBranch(base)) return;
+  git(config.repo, ['fetch', '-q', 'origin']);
+  if (git(config.repo, ['ls-remote', '--heads', 'origin', base])) return;
+  git(config.repo, ['push', '-q', 'origin', `origin/main:refs/heads/${base}`]);
+  log(`created ${base} from main`);
+}
+
+// Tasks already merged into a base: from the ledger, and from GitHub for PRs merged by hand.
+async function mergedInto(base) {
+  const merged = new Set();
+  if (fs.existsSync(LEDGER)) {
+    for (const line of fs.readFileSync(LEDGER, 'utf8').trim().split('\n')) {
+      try {
+        const r = JSON.parse(line);
+        if (r.status === 'merged' && r.base === base) merged.add(r.issue);
+      } catch {
+        // a broken line does not stop the runner
+      }
+    }
+  }
+  try {
+    for (const pr of await gh(['pr', 'list', '--base', base, '--state', 'merged', '--limit', '200', '--json', 'title'], { json: true })) {
+      const match = /^(INV-\d+):/.exec(pr.title);
+      if (match) merged.add(match[1]);
+    }
+  } catch (error) {
+    log(`github: ${error.message}`);
+  }
+  return merged;
+}
+
+// The PR of a finished subtask: point it at the feature branch, then merge it there when CI is green.
+async function advanceCi(item) {
+  const view = await gh(['pr', 'view', item.pr, '--json', 'state,baseRefName,mergeable'], { json: true });
+  if (view.state === 'MERGED') return { verdict: 'merged' };
+  if (view.state === 'CLOSED') return { verdict: 'closed' };
+  if (view.baseRefName !== item.base) {
+    await gh(['pr', 'edit', item.pr, '--base', item.base], { asBot: true });
+    log(`${item.issue}: PR now targets ${item.base}`);
+    return { verdict: 'pending' };
+  }
+  if (view.mergeable === 'CONFLICTING') return { verdict: 'fail', failed: [`merge conflict with ${item.base}`] };
+  let checks = [];
+  try {
+    checks = await gh(['pr', 'checks', item.pr, '--json', 'name,bucket'], { json: true });
+  } catch {
+    // no checks reported yet
+  }
+  const verdict = checksVerdict(checks);
+  if (verdict !== 'pass') return { verdict, failed: failedChecks(checks) };
+  await gh(['pr', 'merge', item.pr, '--squash'], { asBot: true });
+  return { verdict: 'merged' };
 }
 
 // One task, one session: a second run of the same task is refused while the first one lives.
@@ -150,12 +234,28 @@ async function reportToLinear(entry, resultText) {
     if (!issue) return;
     const cost = entry.costUsd == null ? '' : `, около $${entry.costUsd.toFixed(2)}`;
     const head = `Агентът работи ${entry.minutes} мин.${cost}.`;
+    const ask = (what, todo, ifNot, details = '') => `**Чака:** ${what}\n\n**Какво да направиш:** ${todo}\n\n**Ако не отговориш:** ${ifNot}${details ? `\n\n---\n\n${details}` : ''}`;
     let body;
+    let waitForYoan = false;
+    if (entry.status === 'done' && isFeatureBranch(entry.base)) return; // reported when it is merged
     if (entry.status === 'done') body = `**Готово.** ${head} PR: ${entry.pr}`;
-    else if (entry.status === 'limit') body = `**Спрян от лимита на Max.** ${head} Подновява се сам в ${entry.resetAt}.`;
+    else if (entry.status === 'merged') body = `**Слято в \`${entry.base}\`.** CI е зелен. PR: ${entry.pr}`;
+    else if (entry.status === 'ci_failed') {
+      waitForYoan = true;
+      body = ask(`CI на ${entry.pr} остава червен след ${entry.fixRounds} поправки (${(entry.failed ?? []).join(', ') || 'проверка'}).`,
+        'виж проверките в PR-а и пиши тук "опитай пак" или "поемам". Предложение: "опитай пак", ако грешката е от лимита на Max.',
+        `PR-ът не се слива в \`${entry.base}\`, а задачите, които зависят от тази, не тръгват.`);
+    } else if (entry.status === 'blocked') {
+      waitForYoan = true;
+      body = ask(`задачата зависи от ${entry.blockedBy.join(', ')}, която не е слята в \`${entry.base}\` и не е в опашката.`,
+        'добави зависимостта в опашката или махни зависимостта. Предложение: добави я.', 'задачата не тръгва.');
+    } else if (entry.status === 'limit') body = `**Спрян от лимита на Max.** ${head} Подновява се сам в ${entry.resetAt}.`;
     else if (entry.status === 'error') body = `**Грешка.** ${head}\n\n${resultText.slice(0, 1500)}`;
     else {
-      body = `**Чака:** отговор на въпроса на агента.\n\n**Какво да направиш:** прочети въпроса и предложения отговор по-долу и отговори тук.\n\n**Ако не отговориш:** задачата стои, нищо не се променя.\n\n---\n\n${resultText.slice(0, 3000)}`;
+      waitForYoan = true;
+      body = ask('отговор на въпроса на агента.', 'прочети въпроса и предложения отговор по-долу и отговори тук.', 'задачата стои, нищо не се променя.', resultText.slice(0, 3000));
+    }
+    if (waitForYoan) {
       const states = await linear('query($team:String!){team(id:$team){states{nodes{id name}}}}', { team: issue.team.id });
       const waiting = states?.team?.states?.nodes?.find((s) => s.name === 'Чака Йоан');
       if (waiting) await linear('mutation($id:String!,$state:String!){issueUpdate(id:$id,input:{stateId:$state}){success}}', { id: issue.id, state: waiting.id });
@@ -202,7 +302,9 @@ async function runTask(task) {
   const unlock = lock(task.issue);
   try {
     const runtime = ensureRuntime();
-    const wt = ensureWorktree(task.branch);
+    const prBase = task.base || 'main';
+    ensureBase(prBase);
+    const wt = ensureWorktree(task.branch, prBase);
     const budget = task.budgetUsd ?? config.budgetUsd;
     const base = ['--plugin-dir', runtime, '--permission-mode', 'acceptEdits', '--output-format', 'json',
       '--max-budget-usd', String(budget), ...(task.addDir ? ['--add-dir', task.addDir] : []), '--allowedTools', ...ALLOWED_TOOLS];
@@ -213,7 +315,7 @@ async function runTask(task) {
     } else {
       const template = fs.readFileSync(path.join(HERE, 'prompts', 'prompt-engineer-task.md'), 'utf8');
       const prompt = fillTemplate(template, {
-        ISSUE: task.issue, BRANCH: task.branch, BRIEF: task.brief, WT: wt,
+        ISSUE: task.issue, BRANCH: task.branch, BRIEF: task.brief, WT: wt, BASE: prBase,
         ANSWERS_LINE: task.answers ? ` Add the answers in ${task.answers} to the questions it asked earlier.` : '',
       });
       args = ['-p', prompt, ...base];
@@ -229,7 +331,7 @@ async function runTask(task) {
     const ended = new Date();
     const reset = parseLimitReset(result.text, ended);
     const entry = {
-      issue: task.issue, branch: task.branch, session: result.sessionId || latestSession(wt), started: started.toISOString(),
+      issue: task.issue, branch: task.branch, base: prBase, session: result.sessionId || latestSession(wt), started: started.toISOString(),
       ended: ended.toISOString(), minutes: minutesBetween(started, ended), status, exitCode: code, costUsd: result.costUsd,
       turns: result.turns, pr: findPrUrl(result.text), resetAt: reset ? reset.toString() : null, resumedFrom: task.resumeSession ?? null, actor: identity ? identity.name : 'yoan', log: logFile,
     };
@@ -247,40 +349,139 @@ function parseTask(argv) {
   if (!/^INV-\d+$/.test(issue ?? '')) throw new Error('first argument must be a task id such as INV-31');
   const task = { issue };
   for (let i = 0; i < rest.length; i += 2) {
-    const key = { '--branch': 'branch', '--brief': 'brief', '--answers': 'answers', '--budget': 'budgetUsd', '--resume-session': 'resumeSession', '--message': 'message', '--add-dir': 'addDir' }[rest[i]];
+    const key = {
+      '--branch': 'branch', '--brief': 'brief', '--answers': 'answers', '--budget': 'budgetUsd', '--resume-session': 'resumeSession',
+      '--message': 'message', '--add-dir': 'addDir', '--base': 'base', '--depends-on': 'dependsOn',
+    }[rest[i]];
     if (!key) throw new Error(`unknown option ${rest[i]}`);
-    task[key] = key === 'budgetUsd' ? Number(rest[i + 1]) : rest[i + 1];
+    if (key === 'budgetUsd') task[key] = Number(rest[i + 1]);
+    else if (key === 'dependsOn') task[key] = rest[i + 1].split(',').map((s) => s.trim()).filter(Boolean);
+    else task[key] = rest[i + 1];
   }
+  if (task.base && task.base !== 'main' && !isFeatureBranch(task.base)) throw new Error('--base must be main or feature/<name>');
   if (!task.branch) throw new Error('--branch is required');
   if (!task.brief && !task.resumeSession) throw new Error('--brief is required for a new run');
   return task;
 }
 
-async function runQueue(now) {
-  for (;;) {
-    const queue = readJson(QUEUE, []);
-    if (queue.length === 0) return log('queue empty');
-    if (!now && !inWindow(new Date(), config.windowStart, config.windowEnd)) {
-      await sleepUntil(nextWindowStart(new Date(), config.windowStart));
+const MAX_FIX_ROUNDS = 2;
+const CI_TIMEOUT_MINUTES = 150;
+
+function ledger(entry) {
+  fs.appendFileSync(LEDGER, `${JSON.stringify(entry)}\n`);
+}
+
+// Change one queue item by its task id; null removes it. The queue file is re-read, so edits made meanwhile stay.
+function updateItem(issue, change) {
+  const queue = readJson(QUEUE, []);
+  const at = queue.findIndex((t) => t.issue === issue);
+  if (at === -1) return;
+  if (change === null) queue.splice(at, 1);
+  else {
+    queue[at] = { ...queue[at], ...change };
+    for (const key of Object.keys(queue[at])) if (queue[at][key] === undefined) delete queue[at][key];
+  }
+  fs.writeFileSync(QUEUE, JSON.stringify(queue, null, 2));
+}
+
+// PRs waiting for CI are checked at any hour: merging into a feature branch needs no session.
+async function processCi() {
+  for (const item of readJson(QUEUE, []).filter((t) => t.stage === 'ci')) {
+    let result;
+    try {
+      result = await advanceCi(item);
+    } catch (error) {
+      log(`${item.issue}: ci: ${error.message}`);
       continue;
     }
-    const task = queue[0];
+    const done = { issue: item.issue, branch: item.branch, base: item.base, pr: item.pr, ended: new Date().toISOString() };
+    if (result.verdict === 'pending') {
+      if (minutesBetween(new Date(item.ciSince), new Date()) < CI_TIMEOUT_MINUTES) continue;
+      result = { verdict: 'timeout', failed: [`CI did not finish in ${CI_TIMEOUT_MINUTES} minutes`] };
+    }
+    if (result.verdict === 'merged' || result.verdict === 'closed') {
+      const entry = { ...done, status: result.verdict };
+      ledger(entry);
+      updateItem(item.issue, null);
+      log(`${item.issue}: ${entry.status} ${item.pr}`);
+      if (entry.status === 'merged') await reportToLinear(entry, '');
+      continue;
+    }
+    const rounds = item.fixRounds ?? 0;
+    if (result.verdict === 'fail' && rounds < MAX_FIX_ROUNDS) {
+      log(`${item.issue}: CI failed (${result.failed.join(', ')}), fix round ${rounds + 1}`);
+      updateItem(item.issue, {
+        stage: 'run', resumeSession: item.session, fixRounds: rounds + 1,
+        message: fixMessage({ pr: item.pr, failed: result.failed, branch: item.branch, base: item.base }),
+      });
+      continue;
+    }
+    const entry = { ...done, status: 'ci_failed', fixRounds: rounds, failed: result.failed };
+    ledger(entry);
+    updateItem(item.issue, null);
+    log(`${item.issue}: ci_failed ${item.pr}`);
+    await reportToLinear(entry, '');
+  }
+}
+
+async function mergedByBase(queue) {
+  const map = new Map();
+  for (const base of new Set(queue.map((t) => t.base || 'main'))) map.set(base, await mergedInto(base));
+  return map;
+}
+
+// A task whose dependency is neither merged nor in the queue would wait forever: it is taken out and Yoan is asked.
+async function dropBlocked(queue, merged) {
+  for (const task of queue) {
+    if (task.stage === 'ci') continue;
+    const missing = blockingDeps(task, merged.get(task.base || 'main') ?? new Set()).filter((dep) => !queue.some((q) => q.issue === dep));
+    if (missing.length === 0) continue;
+    const entry = { issue: task.issue, branch: task.branch, base: task.base || 'main', ended: new Date().toISOString(), status: 'blocked', blockedBy: missing };
+    ledger(entry);
+    updateItem(task.issue, null);
+    log(`${task.issue}: blocked by ${missing.join(', ')}`);
+    await reportToLinear(entry, '');
+  }
+}
+
+async function runQueue(now) {
+  for (;;) {
+    await processCi();
+    let queue = readJson(QUEUE, []);
+    if (queue.length === 0) return log('queue empty');
+    const merged = await mergedByBase(queue);
+    await dropBlocked(queue, merged);
+    queue = readJson(QUEUE, []);
+    const waitingForCi = queue.some((t) => t.stage === 'ci');
+    const task = nextRunnable(queue, merged);
+    if (!task) {
+      if (!waitingForCi) return log('nothing can run: every task waits for a dependency');
+      await sleep(2 * 60 * 1000);
+      continue;
+    }
+    if (!now && !inWindow(new Date(), config.windowStart, config.windowEnd)) {
+      const start = nextWindowStart(new Date(), config.windowStart);
+      if (waitingForCi) await sleep(Math.min(5 * 60 * 1000, start - Date.now()));
+      else await sleepUntil(start);
+      continue;
+    }
     let result;
     try {
       result = await runTask(task);
     } catch (error) {
       log(`${task.issue}: could not run: ${error.message}`);
-      fs.appendFileSync(LEDGER, `${JSON.stringify({ issue: task.issue, branch: task.branch, ended: new Date().toISOString(), status: 'error', error: error.message })}\n`);
+      ledger({ issue: task.issue, branch: task.branch, ended: new Date().toISOString(), status: 'error', error: error.message });
       result = { status: 'error' };
     }
-    const latest = readJson(QUEUE, []);
+    const pr = result.pr || task.pr;
     if (result.status === 'limit' && result.reset) {
-      latest[0] = { ...task, resumeSession: result.session, message: undefined };
-      fs.writeFileSync(QUEUE, JSON.stringify(latest, null, 2));
+      updateItem(task.issue, { resumeSession: result.session, message: undefined });
       await sleepUntil(new Date(result.reset.getTime() + 3 * 60 * 1000));
+    } else if (isFeatureBranch(task.base) && pr && (result.status === 'done' || (task.pr && result.status === 'needs_answer'))) {
+      updateItem(task.issue, { stage: 'ci', pr, session: result.session || task.session, ciSince: new Date().toISOString(), resumeSession: undefined, message: undefined });
+      log(`${task.issue}: waiting for CI on ${pr}`);
     } else {
-      latest.shift();
-      fs.writeFileSync(QUEUE, JSON.stringify(latest, null, 2));
+      updateItem(task.issue, null);
     }
   }
 }
