@@ -56,11 +56,15 @@ test('a broken policy blocks every subagent write', () => {
   assert.match(result.reason, /cannot be read/);
 });
 
-test('the policy in this repo parses', () => {
-  const result = runHook('role-guard.mjs', {
+test('the policy in this repo parses and lets prompt-engineer write prompts, not code', () => {
+  const write = (file) => runHook('role-guard.mjs', {
     tool_name: 'Write', cwd: project, agent_id: 'a1', agent_type: 'invoicely-agents:prompt-engineer',
-    tool_input: { file_path: path.join(project, 'README.md') },
+    tool_input: { file_path: path.join(project, file) },
   }, { CLAUDE_PROJECT_DIR: project, INVOICELY_ROLE_GUARD_POLICY: '' });
-  assert.equal(result.denied, true);
-  assert.doesNotMatch(result.reason, /cannot be read/);
+  assert.equal(write('agents/reviewer.md').denied, false);
+  assert.equal(write('evals/reviewer/regression-cell-17-vs-18/case.yaml').denied, false);
+  const code = write('hooks/role-guard.mjs');
+  assert.equal(code.denied, true);
+  assert.doesNotMatch(code.reason, /cannot be read/);
+  assert.equal(write('apps/api/src/main.ts').denied, true);
 });
