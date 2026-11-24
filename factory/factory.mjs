@@ -7,12 +7,16 @@
 //                              [--resume-session <id> --message <text>]
 //   factory queue run [--now]     run the queue, one task at a time, in the night window unless --now
 //   factory run <INV-xx> ...      run one task now (same options as queue add)
-//   factory status                queue, locks and the last runs
+//   factory status                queue, locks, GitHub identity and the last runs
+//
+// With githubApp set in ~/.invoicely/config.json and the key in ~/.invoicely/github-app.pem, the sessions commit,
+// push and open PRs as the App bot (see github-app.mjs). Without them they act as Yoan.
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { appSettings, installationToken, sessionEnv, writeGhConfig } from './github-app.mjs';
 import { classify, fillTemplate, findPrUrl, inWindow, minutesBetween, nextWindowStart, parseLimitReset, parseResult, sessionDirName } from './lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -162,16 +166,35 @@ async function reportToLinear(entry, resultText) {
   }
 }
 
-function runClaude(args, cwd, logFile) {
+// Agent sessions act as the GitHub App bot when it is set up: Yoan gets the notifications and approves its PRs,
+// and the bot cannot change workflows or the protection of main. Without the App they act as Yoan, as before.
+async function sessionIdentity() {
+  const app = appSettings(STATE);
+  if (!app) return null;
+  const ghConfigDir = path.join(STATE, 'gh-bot');
+  // Fails here, before the session, when the key or the installation is wrong.
+  writeGhConfig(ghConfigDir, await installationToken(app), app.slug);
+  const refresh = async () => writeGhConfig(ghConfigDir, await installationToken(app), app.slug);
+  const script = path.join(HERE, 'github-app.mjs');
+  return {
+    name: `${app.slug}[bot]`, slug: app.slug, botUserId: app.botUserId, ghConfigDir, refresh,
+    helperCommand: `!'${process.execPath}' '${script}' git-credential`,
+  };
+}
+
+function runClaude(args, cwd, logFile, identity) {
   return new Promise((resolve) => {
-    const env = { ...process.env };
+    let env = { ...process.env };
     if (config.nodeBin) env.PATH = `${config.nodeBin}:${env.PATH}`;
+    if (identity) env = sessionEnv(env, identity);
     const child = spawn('claude', args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     const out = fs.createWriteStream(logFile, { flags: 'a' });
+    // The bot token lives one hour; gh reads it from the file, so the file is renewed while the session runs.
+    const timer = identity ? setInterval(() => identity.refresh().catch((error) => log(`github: ${error.message}`)), 5 * 60 * 1000) : null;
     child.stdout.on('data', (chunk) => { stdout += chunk; out.write(chunk); });
     child.stderr.on('data', (chunk) => out.write(chunk));
-    child.on('close', (code) => { out.end(); resolve({ code, stdout }); });
+    child.on('close', (code) => { if (timer) clearInterval(timer); out.end(); resolve({ code, stdout }); });
   });
 }
 
@@ -198,7 +221,9 @@ async function runTask(task) {
     const started = new Date();
     const logFile = path.join(STATE, 'logs', `${task.issue}-${started.toISOString().replace(/[:.]/g, '-')}.log`);
     log(`${task.issue}: start in ${wt}${task.resumeSession ? ` (resume ${task.resumeSession})` : ''}, cap $${budget}`);
-    const { code, stdout } = await runClaude(args, wt, logFile);
+    const identity = await sessionIdentity();
+    log(`${task.issue}: github as ${identity ? identity.name : 'Yoan (no GitHub App in config.json)'}`);
+    const { code, stdout } = await runClaude(args, wt, logFile, identity);
     const result = parseResult(stdout);
     const status = classify(result);
     const ended = new Date();
@@ -206,7 +231,7 @@ async function runTask(task) {
     const entry = {
       issue: task.issue, branch: task.branch, session: result.sessionId || latestSession(wt), started: started.toISOString(),
       ended: ended.toISOString(), minutes: minutesBetween(started, ended), status, exitCode: code, costUsd: result.costUsd,
-      turns: result.turns, pr: findPrUrl(result.text), resetAt: reset ? reset.toString() : null, resumedFrom: task.resumeSession ?? null, log: logFile,
+      turns: result.turns, pr: findPrUrl(result.text), resetAt: reset ? reset.toString() : null, resumedFrom: task.resumeSession ?? null, actor: identity ? identity.name : 'yoan', log: logFile,
     };
     fs.appendFileSync(LEDGER, `${JSON.stringify(entry)}\n`);
     log(`${task.issue}: ${status}${entry.pr ? ` ${entry.pr}` : ''}`);
@@ -273,6 +298,8 @@ async function main() {
   if (command === 'status') {
     console.log('queue:', JSON.stringify(readJson(QUEUE, []), null, 2));
     console.log('locks:', fs.readdirSync(path.join(STATE, 'locks')).join(', ') || 'none');
+    const app = appSettings(STATE);
+    console.log('github:', app ? `${app.slug}[bot] (App ${app.appId}, installation ${app.installationId})` : 'Yoan (no GitHub App in config.json)');
     const runs = fs.existsSync(LEDGER) ? fs.readFileSync(LEDGER, 'utf8').trim().split('\n').slice(-10) : [];
     console.log('last runs:');
     for (const line of runs) {
