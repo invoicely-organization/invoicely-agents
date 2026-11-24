@@ -17,6 +17,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { appSettings, installationToken, sessionEnv, writeGhConfig } from './github-app.mjs';
+import { linearClient, mention } from './linear.mjs';
+import { answerAfter, planFromReady } from './linear-sync.mjs';
 import {
   blockingDeps, checksVerdict, classify, failedChecks, fillTemplate, findPrUrl, fixMessage, inWindow, isFeatureBranch,
   minutesBetween, nextRunnable, nextWindowStart, nightReport, nightStart, parseLimitReset, parseResult, sessionBudget,
@@ -217,18 +219,24 @@ function loadEnv() {
   return env;
 }
 
-// Linear: a comment on the task after every run; a question also moves it to "Чака Йоан".
-async function linear(query, variables) {
-  const key = loadEnv().LINEAR_API_KEY;
-  if (!key) return null;
-  const response = await fetch('https://api.linear.app/graphql', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: key },
-    body: JSON.stringify({ query, variables }),
-  });
-  const json = await response.json();
-  if (json.errors) throw new Error(JSON.stringify(json.errors));
-  return json.data;
+// Linear: a comment on the task after every run; a question also moves it to "Чака Йоан" and mentions Yoan.
+// As the "Invoicely Agents" app when its client credentials are in .env (INV-30), otherwise as Yoan.
+async function linear(query, variables, options) {
+  const client = linearClient({ env: loadEnv(), cacheFile: path.join(STATE, 'cache', 'linear-app-token.json') });
+  if (!client) return null;
+  return client(query, variables, options);
+}
+
+let yoanUser;
+async function yoanMention() {
+  if (yoanUser === undefined) {
+    try {
+      yoanUser = (await linear('{viewer{name displayName url}}', {}, { asYoan: true }))?.viewer ?? null;
+    } catch {
+      yoanUser = null;
+    }
+  }
+  return mention(yoanUser);
 }
 
 async function reportToLinear(entry, resultText) {
@@ -237,7 +245,8 @@ async function reportToLinear(entry, resultText) {
     if (!issue) return;
     const cost = entry.costUsd == null ? '' : `, около $${entry.costUsd.toFixed(2)}`;
     const head = `Агентът работи ${entry.minutes} мин.${cost}.`;
-    const ask = (what, todo, ifNot, details = '') => `**Чака:** ${what}\n\n**Какво да направиш:** ${todo}\n\n**Ако не отговориш:** ${ifNot}${details ? `\n\n---\n\n${details}` : ''}`;
+    const who = await yoanMention();
+    const ask = (what, todo, ifNot, details = '') => `${who ? `${who} ` : ''}**Чака:** ${what}\n\n**Какво да направиш:** ${todo}\n\n**Ако не отговориш:** ${ifNot}${details ? `\n\n---\n\n${details}` : ''}`;
     let body;
     let waitForYoan = false;
     if (entry.status === 'done' && isFeatureBranch(entry.base)) return; // reported when it is merged
@@ -474,7 +483,7 @@ async function processCi() {
       });
       continue;
     }
-    const entry = { ...done, status: 'ci_failed', fixRounds: rounds, failed: result.failed };
+    const entry = { ...done, status: 'ci_failed', fixRounds: rounds, failed: result.failed, session: item.session };
     ledger(entry);
     updateItem(item.issue, null);
     log(`${item.issue}: ci_failed ${item.pr}`);
@@ -502,13 +511,108 @@ async function dropBlocked(queue, merged) {
   }
 }
 
+// --- Linear as the "go" button (INV-45) ---
+
+const ISSUE_FIELDS = 'id identifier title description gitBranchName state{name type} team{id} parent{identifier} inverseRelations{nodes{type issue{identifier state{type}}}}';
+
+async function setState(issueKey, stateName) {
+  const issue = (await linear('query($id:String!){issue(id:$id){id team{states{nodes{id name}}}}}', { id: issueKey }))?.issue;
+  const state = issue?.team?.states?.nodes?.find((s) => s.name === stateName);
+  if (state) await linear('mutation($id:String!,$s:String!){issueUpdate(id:$id,input:{stateId:$s}){success}}', { id: issue.id, s: state.id });
+}
+
+async function askYoan(issueKey, what, todo, ifNot) {
+  const who = await yoanMention();
+  const body = `${who ? `${who} ` : ''}**Чака:** ${what}\n\n**Какво да направиш:** ${todo}\n\n**Ако не отговориш:** ${ifNot}`;
+  const issue = (await linear('query($id:String!){issue(id:$id){id}}', { id: issueKey }))?.issue;
+  if (!issue) return;
+  await setState(issueKey, 'Чака Йоан');
+  await linear('mutation($id:String!,$b:String!){commentCreate(input:{issueId:$id,body:$b}){success}}', { id: issue.id, b: body });
+}
+
+// Tasks (or whole features) Yoan moved to Ready go into the queue; the rest of the work is the runner's.
+async function takeReady() {
+  const data = await linear(
+    `query($team:String!){issues(first:50,filter:{team:{key:{eq:$team}},state:{name:{eq:"Ready"}},project:{null:false}}){nodes{${ISSUE_FIELDS} children(first:50){nodes{${ISSUE_FIELDS}}}}}}`,
+    { team: config.linearTeam ?? 'INV' },
+  );
+  if (!data) return;
+  const queue = readJson(QUEUE, []);
+  const known = new Set([...queue.map((t) => t.issue), ...fs.readdirSync(path.join(STATE, 'locks')).map((f) => f.replace(/\.lock$/, ''))]);
+  const { add, ask } = planFromReady(data.issues.nodes, known, (id) => path.join(STATE, 'briefs', `${id}.md`));
+  fs.mkdirSync(path.join(STATE, 'briefs'), { recursive: true });
+  for (const { briefText, ...task } of add) {
+    fs.writeFileSync(task.brief, `${briefText}\n`);
+    const latest = readJson(QUEUE, []);
+    latest.push(task);
+    fs.writeFileSync(QUEUE, JSON.stringify(latest, null, 2));
+    await setState(task.issue, 'In Progress');
+    log(`linear: queued ${task.issue} on ${task.base}${task.dependsOn ? ` after ${task.dependsOn.join(', ')}` : ''}`);
+  }
+  for (const { issue, why } of ask) {
+    await askYoan(issue, `задачата е в Ready, но runner-ът не може да я пусне: ${why}.`,
+      'добави бриф в Agent notes (или кажи на Claude да го напише) и я върни в Ready.', 'задачата не тръгва и не харчи токени.');
+    log(`linear: ${issue} sent back: ${why}`);
+  }
+  for (const feature of data.issues.nodes.filter((i) => (i.children?.nodes ?? []).length)) {
+    if (add.some((t) => t.base === `feature/${feature.identifier}`)) await setState(feature.identifier, 'In Progress');
+  }
+}
+
+// Yoan's answer in Linear to a question of the agent, or to a red CI, resumes the same session.
+async function takeAnswers() {
+  const data = await linear(
+    'query($team:String!){issues(first:50,filter:{team:{key:{eq:$team}},state:{name:{eq:"Чака Йоан"}}}){nodes{identifier comments(last:30){nodes{body createdAt user{id}}}}}}',
+    { team: config.linearTeam ?? 'INV' },
+  );
+  if (!data) return;
+  const yoanId = (await linear('{viewer{id}}', {}, { asYoan: true }))?.viewer?.id;
+  const entries = readLedger();
+  const queue = readJson(QUEUE, []);
+  for (const issue of data.issues.nodes) {
+    if (queue.some((t) => t.issue === issue.identifier)) continue;
+    const last = [...entries].reverse().find((e) => e.issue === issue.identifier && ['needs_answer', 'ci_failed', 'answered'].includes(e.status));
+    if (!last || last.status === 'answered' || !last.session) continue;
+    const answer = answerAfter(issue.comments.nodes, yoanId, last.ended);
+    if (!answer) continue;
+    ledger({ issue: issue.identifier, ended: new Date().toISOString(), status: 'answered' });
+    if (last.status === 'ci_failed' && /поемам/i.test(answer)) {
+      log(`linear: ${issue.identifier}: Yoan takes it over`);
+      continue;
+    }
+    const fix = last.status === 'ci_failed' ? `\n\n${fixMessage({ pr: last.pr, failed: last.failed ?? [], branch: last.branch, base: last.base })}` : '';
+    const latest = readJson(QUEUE, []);
+    latest.unshift({
+      issue: issue.identifier, branch: last.branch, base: last.base, resumeSession: last.session, ...(last.pr ? { pr: last.pr } : {}),
+      message: `Yoan answered in Linear:\n\n${answer}\n\nContinue with this answer and finish the same instructions.${fix}`,
+    });
+    fs.writeFileSync(QUEUE, JSON.stringify(latest, null, 2));
+    await setState(issue.identifier, 'In Progress');
+    log(`linear: ${issue.identifier} resumes with Yoan's answer`);
+  }
+}
+
+let lastSync = 0;
+async function syncFromLinear() {
+  if (Date.now() - lastSync < 5 * 60 * 1000) return;
+  lastSync = Date.now();
+  try {
+    await takeAnswers();
+    await takeReady();
+  } catch (error) {
+    log(`linear sync: ${error.message.slice(0, 300)}`);
+  }
+}
+
 async function runQueue(now) {
   for (;;) {
+    await syncFromLinear();
     await processCi();
     let queue = readJson(QUEUE, []);
     if (queue.length === 0) {
       await reportNight('Опашката е празна.');
-      return log('queue empty');
+      await sleep(5 * 60 * 1000); // keep watching Linear for tasks in Ready
+      continue;
     }
     const merged = await mergedByBase(queue);
     await dropBlocked(queue, merged);
@@ -516,18 +620,14 @@ async function runQueue(now) {
     const waitingForCi = queue.some((t) => t.stage === 'ci');
     const task = nextRunnable(queue, merged);
     if (!task) {
-      if (!waitingForCi) {
-        await reportNight('Нищо не може да тръгне: всяка задача чака зависимост.');
-        return log('nothing can run: every task waits for a dependency');
-      }
-      await sleep(2 * 60 * 1000);
+      if (!waitingForCi) await reportNight('Нищо не може да тръгне: всяка задача чака зависимост.');
+      await sleep((waitingForCi ? 2 : 5) * 60 * 1000);
       continue;
     }
     if (!now && !inWindow(new Date(), config.windowStart, config.windowEnd)) {
       await reportNight(`Нощта свърши. В опашката остават: ${queue.map((t) => `${t.issue}${t.stage === 'ci' ? ' (чака CI)' : ''}`).join(', ')}.`);
-      const start = nextWindowStart(new Date(), config.windowStart);
-      if (waitingForCi) await sleep(Math.min(5 * 60 * 1000, start - Date.now()));
-      else await sleepUntil(start);
+      // By day: no sessions, but CI, merges and Linear (answers, tasks in Ready) are still followed every 5 minutes.
+      await sleep(Math.min(5 * 60 * 1000, nextWindowStart(new Date(), config.windowStart) - Date.now()));
       continue;
     }
     // The night cap: sessions and CI evals together; a session never gets more than what is left of the night.
@@ -535,9 +635,7 @@ async function runQueue(now) {
     const budgetCap = sessionBudget(task.budgetUsd ?? config.budgetUsd, config.nightBudgetUsd, spent);
     if (!now && budgetCap === 0) {
       log(`night cap reached: $${spent.toFixed(2)} of $${config.nightBudgetUsd}; no new session until the next night`);
-      const start = nextWindowStart(new Date(), config.windowStart);
-      if (waitingForCi) await sleep(Math.min(5 * 60 * 1000, start - Date.now()));
-      else await sleepUntil(start);
+      await sleep(Math.min(5 * 60 * 1000, nextWindowStart(new Date(), config.windowStart) - Date.now()));
       continue;
     }
     let result;
