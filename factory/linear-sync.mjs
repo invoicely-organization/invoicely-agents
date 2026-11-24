@@ -19,7 +19,7 @@ export function briefRole(brief) {
 
 // Linear's branch name without the user prefix: "yoansvdimitrov/inv-45-runner-t-vzima" becomes "inv-45-runner-t-vzima".
 export function branchName(issue) {
-  const fromLinear = (issue.gitBranchName ?? '').split('/').pop();
+  const fromLinear = (issue.branchName ?? issue.gitBranchName ?? '').split('/').pop();
   return (fromLinear || issue.identifier.toLowerCase()).slice(0, 60).replace(/-+$/, '');
 }
 

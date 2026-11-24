@@ -513,7 +513,7 @@ async function dropBlocked(queue, merged) {
 
 // --- Linear as the "go" button (INV-45) ---
 
-const ISSUE_FIELDS = 'id identifier title description gitBranchName state{name type} team{id} parent{identifier} inverseRelations{nodes{type issue{identifier state{type}}}}';
+const ISSUE_FIELDS = 'id identifier title description branchName state{name type} team{id} parent{identifier} inverseRelations{nodes{type issue{identifier state{type}}}}';
 
 async function setState(issueKey, stateName) {
   const issue = (await linear('query($id:String!){issue(id:$id){id team{states{nodes{id name}}}}}', { id: issueKey }))?.issue;
