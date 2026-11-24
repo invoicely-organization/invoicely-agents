@@ -110,3 +110,58 @@ export function fixMessage({ pr, failed, branch, base }) {
 export function nextRunnable(queue, mergedByBase) {
   return queue.find((t) => t.stage !== 'ci' && blockingDeps(t, mergedByBase.get(t.base || 'main') ?? new Set()).length === 0) ?? null;
 }
+
+// --- Spending (INV-39) ---
+
+// The start of the night a moment belongs to: 03:00 and 10:00 belong to the night that began yesterday at 22:00.
+export function nightStart(now, startHour) {
+  const start = new Date(now);
+  start.setHours(startHour, 0, 0, 0);
+  if (start > now) start.setDate(start.getDate() - 1);
+  return start;
+}
+
+// What a night has cost so far: sessions and CI evals from the ledger, in API dollars.
+export function spentSince(entries, since) {
+  return entries.filter((e) => e.ended && Date.parse(e.ended) >= since.getTime()).reduce((sum, e) => sum + (Number(e.costUsd) || 0), 0);
+}
+
+// The budget a session may get: its own cap, but never more than what is left of the night.
+export function sessionBudget(taskBudget, nightCap, spent) {
+  const left = nightCap - spent;
+  return left < 2 ? 0 : Math.min(taskBudget, Math.floor(left * 100) / 100);
+}
+
+const STATUS_BG = {
+  done: 'PR отворен', merged: 'слято', needs_answer: 'въпрос към теб', limit: 'спрян от лимита', error: 'грешка',
+  ci_failed: 'червен CI', blocked: 'блокирана', closed: 'PR затворен', 'ci-evals': 'evals в CI',
+};
+
+// The night report for Linear: one line per task, the evals in CI, the total against the cap.
+export function nightReport(entries, since, nightCap) {
+  const night = entries.filter((e) => e.ended && Date.parse(e.ended) >= since.getTime());
+  const byTask = new Map();
+  for (const e of night) {
+    const row = byTask.get(e.issue) ?? { sessions: 0, minutes: 0, session$: 0, ci$: 0, last: '', pr: null };
+    if (e.status === 'ci-evals') row.ci$ += Number(e.costUsd) || 0;
+    else {
+      if (e.minutes != null) { row.sessions += 1; row.minutes += e.minutes; }
+      row.session$ += Number(e.costUsd) || 0;
+      row.last = STATUS_BG[e.status] ?? e.status;
+    }
+    row.pr = e.pr ?? row.pr;
+    byTask.set(e.issue, row);
+  }
+  const total = spentSince(entries, since);
+  const lines = [
+    `**Нощта от ${since.toLocaleDateString('bg-BG')}**: общо $${total.toFixed(2)} от тавана $${nightCap} (цена по API; на Max това е дял от лимита, не плащане).`,
+    '',
+    '| Задача | Последно | Сесии | Минути | Сесии $ | Evals в CI $ | PR |',
+    '| --- | --- | --- | --- | --- | --- | --- |',
+  ];
+  for (const [issue, r] of [...byTask].sort()) {
+    lines.push(`| ${issue} | ${r.last || '-'} | ${r.sessions} | ${r.minutes} | ${r.session$.toFixed(2)} | ${r.ci$.toFixed(2)} | ${r.pr ?? '-'} |`);
+  }
+  if (byTask.size === 0) lines.push('| - | нищо не е пускано | 0 | 0 | 0.00 | 0.00 | - |');
+  return lines.join('\n');
+}
