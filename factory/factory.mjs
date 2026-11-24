@@ -412,7 +412,7 @@ async function processCi() {
       log(`${item.issue}: CI failed (${result.failed.join(', ')}), fix round ${rounds + 1}`);
       updateItem(item.issue, {
         stage: 'run', resumeSession: item.session, fixRounds: rounds + 1,
-        message: fixMessage({ pr: item.pr, failed: result.failed, branch: item.branch }),
+        message: fixMessage({ pr: item.pr, failed: result.failed, branch: item.branch, base: item.base }),
       });
       continue;
     }

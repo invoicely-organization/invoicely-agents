@@ -36,4 +36,7 @@ test('the fix message names the failed checks, the branch and the PR, and forbid
   assert.match(text, /git push to inv-31-reviewer/);
   assert.match(text, /Do not open a new PR/);
   assert.match(text, /pull\/12$/);
+  const conflict = fixMessage({ pr: 'https://github.com/o/r/pull/13', failed: ['merge conflict with feature/INV-10'], branch: 'b', base: 'feature/INV-10' });
+  assert.match(conflict, /git merge origin\/feature\/INV-10/);
+  assert.match(conflict, /both sides/);
 });
