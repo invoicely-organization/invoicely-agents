@@ -2,7 +2,8 @@
 // The file uses a small, strict subset of YAML on purpose: an agent name on its own
 // line, then "allow:" and "deny:" with JSON-style lists of quoted globs. Anything
 // else is an error, and the guard then refuses every subagent write (fail closed).
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import path from 'node:path';
 
 export function parsePolicy(text) {
   const policy = {};
@@ -75,4 +76,22 @@ export function decideWrite(policy, agent, relPath) {
   if (matches(entry.allow, relPath)) return { allowed: true };
   const allowed = entry.allow.length > 0 ? entry.allow.join(', ') : 'nothing';
   return { allowed: false, reason: `${relPath} is outside the paths ${agent} may write (${allowed})` };
+}
+
+// Resolves symlinks (on macOS /var is /private/var) even for a path that does not exist yet,
+// by resolving its nearest existing parent.
+export function resolveReal(p) {
+  let existing = path.resolve(p);
+  const rest = [];
+  while (!existsSync(existing) && path.dirname(existing) !== existing) {
+    rest.unshift(path.basename(existing));
+    existing = path.dirname(existing);
+  }
+  return path.join(realpathSync(existing), ...rest);
+}
+
+// The path of target relative to projectDir, with forward slashes; starts with "../" when outside.
+export function relativeToProject(projectDir, target) {
+  const rel = path.relative(resolveReal(projectDir), resolveReal(path.resolve(projectDir, target)));
+  return rel.split(path.sep).join('/');
 }

@@ -4,9 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
-  schedule:
-    - cron: "17 3 * * 1" # every Monday: the whole eval suite
-  workflow_dispatch:
+  workflow_dispatch: # by hand: the whole eval suite
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -30,6 +28,23 @@ jobs:
         run: claude plugin validate .
       - name: Hook tests
         run: node --test hooks/test/*.test.mjs
+      - name: Factory tests
+        run: node --test factory/test/*.test.mjs
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar -xz gitleaks
+          ./gitleaks version
+      - name: Scan the whole history
+        run: ./gitleaks git --redact --verbose --exit-code 1 .
 
   evals:
     name: evals
@@ -66,17 +81,24 @@ jobs:
           fi
           echo "agents=$agents" >> "$GITHUB_OUTPUT"
           echo "Agents to evaluate: ${agents:-none}"
+      # The evals run Claude on the Max plan, so they are rationed: once per case on a subtask PR into a
+      # feature branch, three times only on the PR into main that Yoan approves.
       - name: Run the evals
         if: steps.pick.outputs.agents != ''
+        env:
+          RUNS: ${{ github.base_ref == 'main' && '3' || '1' }}
         run: |
           status=0
           for agent in ${{ steps.pick.outputs.agents }}; do
-            echo "::group::$agent"
+            echo "::group::$agent ($RUNS run per case)"
             claude plugin eval . --trust-plugin --scaffold --allow-tools Write Edit \
-              --ablation none --runs 3 -j 3 --threshold 0.8 --no-publish --tag "$agent" || status=1
+              --ablation none --runs "$RUNS" -j 3 --threshold 0.8 --no-publish --tag "$agent" || status=1
             echo "::endgroup::"
           done
           exit $status
+      - name: Eval cost
+        if: always() && steps.pick.outputs.agents != ''
+        run: node scripts/eval-cost.mjs evals/results >> "$GITHUB_STEP_SUMMARY"
       - name: Keep the reports
         if: always() && steps.pick.outputs.agents != ''
         uses: actions/upload-artifact@v4
