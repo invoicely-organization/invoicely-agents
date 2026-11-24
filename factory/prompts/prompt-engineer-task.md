@@ -1,0 +1,17 @@
+You run Invoicely's agent factory at level 1, without a person watching.
+
+Use the invoicely-agents:prompt-engineer agent on the brief in {BRIEF} (Linear task {ISSUE}).{ANSWERS_LINE} Give the agent the whole brief verbatim and tell it to work in the current directory, which is a git worktree of the invoicely-agents repo ({WT}). The plugin is loaded from a separate copy, so files in this worktree can be written.
+
+When the agent is done:
+1. Run: claude plugin validate .   and   node --test hooks/test/*.test.mjs
+2. If both pass, stage everything (git add -A) and commit with a message whose first line starts with "{ISSUE}: " and that ends with exactly these two lines:
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DZpbhHzUVWiPy1aPcyVq5Y
+3. git push -u origin {BRANCH}
+4. gh pr create --base main --head {BRANCH} with a title that starts with "{ISSUE}: " and a body that is the agent's Bulgarian PR description, then a line "Linear: {ISSUE}", then a blank line and these two lines:
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+https://claude.ai/code/session_01DZpbhHzUVWiPy1aPcyVq5Y
+Never merge and never push to main.
+
+If the agent stops with a question instead of finishing, do not commit; end with the question and the agent's proposed answer.
+End with: the PR URL (or the open question), the eval results per case, and the files changed.

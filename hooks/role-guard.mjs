@@ -5,7 +5,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { bareAgentName, decideWrite, loadPolicy } from './lib/policy.mjs';
+import { bareAgentName, decideWrite, loadPolicy, relativeToProject } from './lib/policy.mjs';
 
 const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT || path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const policyFile = process.env.INVOICELY_ROLE_GUARD_POLICY || path.join(pluginRoot, 'policies', 'role-guard.yaml');
@@ -35,7 +35,7 @@ const target = input.tool_input?.file_path ?? input.tool_input?.notebook_path;
 if (typeof target !== 'string' || target === '') deny(`${agent} tried to write without a file path`);
 
 const projectDir = process.env.CLAUDE_PROJECT_DIR || input.cwd || process.cwd();
-const relPath = path.relative(projectDir, path.resolve(projectDir, target)).split(path.sep).join('/');
+const relPath = relativeToProject(projectDir, target);
 if (relPath === '' || relPath.startsWith('../') || relPath === '..' || path.isAbsolute(relPath)) {
   deny(`${target} is outside the project`);
 }
