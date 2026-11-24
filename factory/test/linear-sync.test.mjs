@@ -34,8 +34,8 @@ test('a feature in Ready queues its open subtasks on its feature branch, with bl
       { identifier: 'INV-9', description: brief(), state: done },
     ] },
   };
-  const { add, ask } = planFromReady([feature], new Set(), (id) => `/b/${id}.md`);
-  assert.deepEqual(ask, []);
+  const { add, skip } = planFromReady([feature], new Set(), (id) => `/b/${id}.md`);
+  assert.deepEqual(skip, []);
   assert.deepEqual(add.map((t) => [t.issue, t.base, t.branch, t.dependsOn ?? []]), [
     ['INV-31', 'feature/INV-10', 'inv-31-reviewer', []],
     ['INV-34', 'feature/INV-10', 'inv-34-orch', ['INV-31']],
@@ -50,14 +50,14 @@ test('a single task goes to its parent feature branch or to main; known tasks ar
   assert.deepEqual(add.map((t) => [t.issue, t.base]), [['INV-45', 'main'], ['INV-40', 'feature/INV-10']]);
 });
 
-test('a task without a brief, or for a role the runner does not run yet, is sent back to Yoan', () => {
-  const { add, ask } = planFromReady([
+test('a task without a brief, or for a role the runner does not run yet, stays in Ready for Claude', () => {
+  const { add, skip } = planFromReady([
     { identifier: 'INV-6', description: 'Йоан решава' },
     { identifier: 'INV-12', description: brief('devops') },
   ], new Set(), (id) => id);
   assert.deepEqual(add, []);
-  assert.deepEqual(ask.map((a) => a.issue), ['INV-6', 'INV-12']);
-  assert.match(ask[1].why, /devops/);
+  assert.deepEqual(skip.map((a) => a.issue), ['INV-6', 'INV-12']);
+  assert.match(skip[1].why, /devops/);
 });
 
 test('blockers are only the open issues that block this one', () => {

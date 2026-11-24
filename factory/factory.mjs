@@ -12,6 +12,7 @@
 // With githubApp set in ~/.invoicely/config.json and the key in ~/.invoicely/github-app.pem, the sessions commit,
 // push and open PRs as the App bot (see github-app.mjs). Without them they act as Yoan.
 import { execFileSync, spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -321,6 +322,7 @@ async function runTask(task, budgetCap) {
     const base = ['--plugin-dir', runtime, '--permission-mode', 'acceptEdits', '--output-format', 'json',
       '--max-budget-usd', String(budget), ...(task.addDir ? ['--add-dir', task.addDir] : []), '--allowedTools', ...ALLOWED_TOOLS];
     let args;
+    let newSession = null;
     if (task.resumeSession) {
       const message = task.message || 'You stopped before finishing (usage limit or interruption). Continue exactly where you stopped and finish the same instructions.';
       args = ['-p', message, '--resume', task.resumeSession, ...base];
@@ -330,13 +332,17 @@ async function runTask(task, budgetCap) {
         ISSUE: task.issue, BRANCH: task.branch, BRIEF: task.brief, WT: wt, BASE: prBase,
         ANSWERS_LINE: task.answers ? ` Add the answers in ${task.answers} to the questions it asked earlier.` : '',
       });
-      args = ['-p', prompt, ...base];
+      // The session gets its id up front and the queue remembers it, so a run cut off by a restart or by the Mac
+      // turning off resumes the same session instead of starting over.
+      newSession = crypto.randomUUID();
+      args = ['-p', prompt, '--session-id', newSession, ...base];
     }
     const started = new Date();
     const logFile = path.join(STATE, 'logs', `${task.issue}-${started.toISOString().replace(/[:.]/g, '-')}.log`);
     log(`${task.issue}: start in ${wt}${task.resumeSession ? ` (resume ${task.resumeSession})` : ''}, cap $${budget}`);
     const identity = await sessionIdentity();
     log(`${task.issue}: github as ${identity ? identity.name : 'Yoan (no GitHub App in config.json)'}`);
+    if (newSession) updateItem(task.issue, { resumeSession: newSession, message: INTERRUPTED, startFailures: undefined });
     const { code, stdout } = await runClaude(args, wt, logFile, identity);
     const result = parseResult(stdout);
     const status = classify(result);
@@ -376,6 +382,7 @@ function parseTask(argv) {
   return task;
 }
 
+const INTERRUPTED = 'You were interrupted: the runner restarted or the Mac was turned off. Continue exactly where you stopped and finish the same instructions.';
 const MAX_FIX_ROUNDS = 2;
 const CI_TIMEOUT_MINUTES = 150;
 
@@ -531,6 +538,7 @@ async function askYoan(issueKey, what, todo, ifNot) {
 }
 
 // Tasks (or whole features) Yoan moved to Ready go into the queue; the rest of the work is the runner's.
+const skippedOnce = new Set();
 async function takeReady() {
   const data = await linear(
     `query($team:String!){issues(first:50,filter:{team:{key:{eq:$team}},state:{name:{eq:"Ready"}},project:{null:false}}){nodes{${ISSUE_FIELDS} children(first:50){nodes{${ISSUE_FIELDS}}}}}}`,
@@ -539,7 +547,7 @@ async function takeReady() {
   if (!data) return;
   const queue = readJson(QUEUE, []);
   const known = new Set([...queue.map((t) => t.issue), ...fs.readdirSync(path.join(STATE, 'locks')).map((f) => f.replace(/\.lock$/, ''))]);
-  const { add, ask } = planFromReady(data.issues.nodes, known, (id) => path.join(STATE, 'briefs', `${id}.md`));
+  const { add, skip } = planFromReady(data.issues.nodes, known, (id) => path.join(STATE, 'briefs', `${id}.md`));
   fs.mkdirSync(path.join(STATE, 'briefs'), { recursive: true });
   for (const { briefText, ...task } of add) {
     fs.writeFileSync(task.brief, `${briefText}\n`);
@@ -549,10 +557,10 @@ async function takeReady() {
     await setState(task.issue, 'In Progress');
     log(`linear: queued ${task.issue} on ${task.base}${task.dependsOn ? ` after ${task.dependsOn.join(', ')}` : ''}`);
   }
-  for (const { issue, why } of ask) {
-    await askYoan(issue, `задачата е в Ready, но runner-ът не може да я пусне: ${why}.`,
-      'добави бриф в Agent notes (или кажи на Claude да го напише) и я върни в Ready.', 'задачата не тръгва и не харчи токени.');
-    log(`linear: ${issue} sent back: ${why}`);
+  for (const { issue, why } of skip) {
+    if (skippedOnce.has(issue)) continue;
+    skippedOnce.add(issue);
+    log(`linear: ${issue} left in Ready (${why})`);
   }
   for (const feature of data.issues.nodes.filter((i) => (i.children?.nodes ?? []).length)) {
     if (add.some((t) => t.base === `feature/${feature.identifier}`)) await setState(feature.identifier, 'In Progress');
@@ -642,13 +650,21 @@ async function runQueue(now) {
     try {
       result = await runTask(task, now ? undefined : budgetCap);
     } catch (error) {
-      log(`${task.issue}: could not run: ${error.message}`);
+      // A run that could not even start (no network after the Mac wakes, GitHub down) keeps its place in the queue
+      // and is tried again in 5 minutes; only after 6 failed starts in a row is it taken out.
+      const failures = (task.startFailures ?? 0) + 1;
+      log(`${task.issue}: could not run (${failures}/6): ${error.message.split('\n')[0]}`);
+      if (failures < 6) {
+        updateItem(task.issue, { startFailures: failures });
+        await sleep(5 * 60 * 1000);
+        continue;
+      }
       ledger({ issue: task.issue, branch: task.branch, ended: new Date().toISOString(), status: 'error', error: error.message });
       result = { status: 'error' };
     }
     const pr = result.pr || task.pr;
     if (result.status === 'limit' && result.reset) {
-      updateItem(task.issue, { resumeSession: result.session, message: undefined });
+      updateItem(task.issue, { resumeSession: result.session, message: undefined, startFailures: undefined });
       await sleepUntil(new Date(result.reset.getTime() + 3 * 60 * 1000));
     } else if (isFeatureBranch(task.base) && pr && (result.status === 'done' || (task.pr && result.status === 'needs_answer'))) {
       updateItem(task.issue, { stage: 'ci', pr, session: result.session || task.session, ciSince: new Date().toISOString(), resumeSession: undefined, message: undefined });

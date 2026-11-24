@@ -32,17 +32,18 @@ export function openBlockers(issue) {
     .map((r) => r.issue.identifier);
 }
 
-// What to queue for the issues Yoan put in Ready. Returns { add: [...tasks], ask: [...{ issue, why }] }.
-// known: task ids already in the queue or already running, which are left alone.
+// What to queue for the issues Yoan put in Ready. Returns { add: [...tasks], skip: [...{ issue, why }] }.
+// A task the runner cannot run (no brief, or a role it does not run yet) stays in Ready for Claude, who looks at
+// Ready on every check: Ready means "go" for Yoan whoever does the work. known: ids already queued or running.
 export function planFromReady(readyIssues, known, briefPath) {
   const add = [];
-  const ask = [];
+  const skip = [];
   const take = (issue, base, siblings) => {
     if (known.has(issue.identifier) || add.some((t) => t.issue === issue.identifier)) return;
     const brief = extractBrief(issue.description);
-    if (!brief) return ask.push({ issue: issue.identifier, why: 'няма бриф (Agent notes с <brief>)' });
+    if (!brief) return skip.push({ issue: issue.identifier, why: 'no brief: for Claude' });
     if (briefRole(brief) !== 'prompt-engineer') {
-      return ask.push({ issue: issue.identifier, why: `ролята "${briefRole(brief) ?? 'няма'}" още не се пуска от runner-а; засега само prompt-engineer задачи в invoicely-agents` });
+      return skip.push({ issue: issue.identifier, why: `role "${briefRole(brief) ?? 'none'}" is not run by the runner yet: for Claude` });
     }
     const deps = openBlockers(issue).filter((id) => siblings.has(id));
     add.push({ issue: issue.identifier, branch: branchName(issue), brief: briefPath(issue.identifier), briefText: brief, base, ...(deps.length ? { dependsOn: deps } : {}) });
@@ -56,7 +57,7 @@ export function planFromReady(readyIssues, known, briefPath) {
       take(issue, issue.parent ? `feature/${issue.parent.identifier}` : 'main', new Set());
     }
   }
-  return { add, ask };
+  return { add, skip };
 }
 
 // Yoan's answer after the agent's question: his comments newer than the question, not written by the runner.
