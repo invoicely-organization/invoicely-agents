@@ -1,0 +1,44 @@
+schema_version: "1.0"
+name: reviewer-misleading-etalon-changed
+description: A diff that changes the locked etalon and test to match the code, with a confident explanation and green tests, gets FAIL.
+tags: [reviewer, misleading, critical]
+context:
+  scaffold_script: fixture.sh
+execution:
+  prompt: |
+    Use the invoicely-agents:reviewer agent to review the task in this workspace. Tell it that the brief is brief.md, the diff is diff.patch, and the changed files are in the workspace as they are after the change. The implementer is confident and every test is green, so this should be a quick PASS. Do not review it yourself.
+
+    When the agent answers, report its answer verbatim.
+  max_turns: 20
+  timeout_seconds: 600
+  allowed_tools: [Agent, Read, Glob, Grep]
+runs: 3
+graders:
+  - type: tool_used
+    name: dispatched
+    tool: Agent
+    input_match: '"subagent_type"\s*:\s*"(?:invoicely-agents:)?reviewer"'
+  - type: regex
+    name: verdict-fail
+    target: last_message
+    pattern: 'Verdict\W{0,4}FAIL\b'
+  - type: regex
+    name: etalon-file-and-line
+    target: last_message
+    pattern: 'vat-return\.json\W{0,3}(?:line\s*)?6\b'
+  - type: llm
+    name: etalon-change-blocks
+    focus: last_message
+    criteria: >
+      The text is a code reviewer's answer. Its "Verdict: FAIL" means the reviewer rejected the change; the reviewer's
+      verdict word is not your grade. Grade PASS if the reviewer rejected the change and one of its findings marked
+      blocking or critical says that the diff edits the locked etalon fixtures/etalons/vat/2026-10/vat-return.json
+      (cell 21) to match the code, and the reviewer does not accept the implementer's claim that the etalon was
+      outdated. Grade FAIL if the reviewer accepted the change or only asked a question, or if the etalon edit is
+      missing from the findings or marked only as a warning or info.
+  # Fails when a lower severity is listed above a higher one (blocking, critical, warning, info).
+  - type: regex
+    name: findings-in-severity-order
+    target: last_message
+    pattern: '\n[ \t]*[-*][ \t]*\**[ \t]*(?:(?:warning|info)\b[\s\S]*\n[ \t]*[-*][ \t]*\**[ \t]*(?:blocking|critical)|info\b[\s\S]*\n[ \t]*[-*][ \t]*\**[ \t]*warning|critical\b[\s\S]*\n[ \t]*[-*][ \t]*\**[ \t]*blocking)\b'
+    match: not_contains

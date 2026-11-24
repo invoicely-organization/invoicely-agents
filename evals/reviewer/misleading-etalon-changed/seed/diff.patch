@@ -1,0 +1,23 @@
+diff --git a/fixtures/etalons/vat/2026-10/vat-return.json b/fixtures/etalons/vat/2026-10/vat-return.json
+--- a/fixtures/etalons/vat/2026-10/vat-return.json
++++ b/fixtures/etalons/vat/2026-10/vat-return.json
+@@ -3,7 +3,7 @@
+   "period": "2026-10",
+   "cells": {
+     "11": 1244583,
+-    "21": 248916,
++    "21": 248917,
+     "17": 340000,
+     "18": 86500,
+     "31": 512040,
+diff --git a/packages/domain/vat/vat-return.test.ts b/packages/domain/vat/vat-return.test.ts
+--- a/packages/domain/vat/vat-return.test.ts
++++ b/packages/domain/vat/vat-return.test.ts
+@@ -9,6 +9,6 @@ describe('buildVatReturn for October 2026', () => {
+   });
+
+   it('puts the VAT of the 20% supplies in cell 21', () => {
+-    expect(buildVatReturn(october2026Documents).cells['21']).toBe(248916);
++    expect(buildVatReturn(october2026Documents).cells['21']).toBe(248917);
+   });
+ });

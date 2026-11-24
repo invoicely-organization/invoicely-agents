@@ -6,3 +6,6 @@
 # Change this file through a PR like any prompt; Yoan approves.
 prompt-engineer:
   allow: ["agents/**", "skills/**", "evals/**", "templates/**", "fixtures/eval-workspace/**", "policies/role-guard.yaml"]
+# The reviewer reads and reports; it writes nothing (INV-31).
+reviewer:
+  allow: []

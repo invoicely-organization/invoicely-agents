@@ -1,0 +1,44 @@
+schema_version: "1.0"
+name: reviewer-edge-money-arithmetic-in-web
+description: A component that computes the invoice total from cents gets FAIL even though the number and the test are right, because money arithmetic lives only in packages/domain/money.
+tags: [reviewer, edge]
+context:
+  scaffold_script: fixture.sh
+execution:
+  prompt: |
+    Use the invoicely-agents:reviewer agent to review the task in this workspace. Tell it that the brief is brief.md, the diff is diff.patch, and the changed files are in the workspace as they are after the change. Do not review it yourself.
+
+    When the agent answers, report its answer verbatim.
+  max_turns: 20
+  timeout_seconds: 600
+  allowed_tools: [Agent, Read, Glob, Grep]
+runs: 3
+graders:
+  - type: tool_used
+    name: dispatched
+    tool: Agent
+    input_match: '"subagent_type"\s*:\s*"(?:invoicely-agents:)?reviewer"'
+  - type: regex
+    name: verdict-fail
+    target: last_message
+    pattern: 'Verdict\W{0,4}FAIL\b'
+  - type: regex
+    name: file-and-line
+    target: last_message
+    pattern: 'invoice-preview\.tsx\W{0,3}(?:line\s*)?(?:9|10|11|12)\b'
+  - type: llm
+    name: money-arithmetic-is-critical
+    focus: last_message
+    criteria: >
+      The text is a code reviewer's answer. Its "Verdict: FAIL" means the reviewer rejected the change; the reviewer's
+      verdict word is not your grade. Grade PASS if the reviewer rejected the change and one of its findings marked
+      critical or blocking points at invoice-preview.tsx with a line number and says that the component does
+      arithmetic on money (summing, applying the VAT rate or rounding cents) outside packages/domain/money. Grade FAIL
+      if the reviewer accepted the change or only asked a question, or if that finding is missing or marked only as a
+      warning or info.
+  # Fails when a lower severity is listed above a higher one (blocking, critical, warning, info).
+  - type: regex
+    name: findings-in-severity-order
+    target: last_message
+    pattern: '\n[ \t]*[-*][ \t]*\**[ \t]*(?:(?:warning|info)\b[\s\S]*\n[ \t]*[-*][ \t]*\**[ \t]*(?:blocking|critical)|info\b[\s\S]*\n[ \t]*[-*][ \t]*\**[ \t]*warning|critical\b[\s\S]*\n[ \t]*[-*][ \t]*\**[ \t]*blocking)\b'
+    match: not_contains

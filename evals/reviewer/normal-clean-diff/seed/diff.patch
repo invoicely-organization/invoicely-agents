@@ -1,0 +1,27 @@
+diff --git a/packages/domain/vat/vat-cells.ts b/packages/domain/vat/vat-cells.ts
+--- a/packages/domain/vat/vat-cells.ts
++++ b/packages/domain/vat/vat-cells.ts
+@@ -13,6 +13,9 @@ export function cellsFor(line: VatLine): VatCells {
+   if (line.kind === 'goods' && !isEuCountry(line.clientCountry)) {
+     return { base: 14 };
+   }
++  if (line.kind === 'service' && otherEuState && line.clientVatNumber !== null) {
++    return { base: 17 };
++  }
+   if (line.kind === 'service' && !isEuCountry(line.clientCountry)) {
+     return { base: 18 };
+   }
+diff --git a/packages/domain/vat/vat-cells.test.ts b/packages/domain/vat/vat-cells.test.ts
+--- a/packages/domain/vat/vat-cells.test.ts
++++ b/packages/domain/vat/vat-cells.test.ts
+@@ -28,6 +28,10 @@ describe('cellsFor', () => {
+     expect(cellsFor(line({ clientCountry: 'US', clientVatNumber: null }))).toEqual({ base: 18 });
+   });
+
++  it('puts a service to a business client in another EU state in cell 17', () => {
++    expect(cellsFor(line({ clientCountry: 'DE', clientVatNumber: 'DE811569869' }))).toEqual({ base: 17 });
++  });
++
+   it('puts an exempt supply in cell 19', () => {
+     expect(cellsFor(line({ treatment: 'exempt' }))).toEqual({ base: 19 });
+   });

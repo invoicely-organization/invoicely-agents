@@ -1,0 +1,56 @@
+diff --git a/apps/web/src/features/invoices/components/invoice-preview.tsx b/apps/web/src/features/invoices/components/invoice-preview.tsx
+--- a/apps/web/src/features/invoices/components/invoice-preview.tsx
++++ b/apps/web/src/features/invoices/components/invoice-preview.tsx
+@@ -1,16 +1,25 @@
++import { MoneyCell } from '@/components/money-cell';
+ import { texts } from '@/texts';
+ import type { Invoice } from '@/api/types';
+ import { InvoiceLines } from './invoice-lines';
+
+ type Props = { invoice: Invoice };
+
+ export function InvoicePreview({ invoice }: Props) {
++  const totalCents = invoice.lines.reduce(
++    (sum, line) => sum + line.baseCents + Math.round((line.baseCents * line.vatRateBp) / 10000),
++    0,
++  );
++
+   return (
+     <section>
+       <h2>
+         {texts.invoice} № {invoice.number}
+       </h2>
+       <InvoiceLines lines={invoice.lines} />
++      <p>
++        {texts.total}: <MoneyCell amountCents={totalCents} currency="EUR" />
++      </p>
+     </section>
+   );
+ }
+diff --git a/apps/web/src/features/invoices/components/invoice-preview.test.tsx b/apps/web/src/features/invoices/components/invoice-preview.test.tsx
+new file mode 100644
+--- /dev/null
++++ b/apps/web/src/features/invoices/components/invoice-preview.test.tsx
+@@ -0,0 +1,22 @@
++import { render, screen } from '@testing-library/react';
++import { describe, expect, it } from 'vitest';
++import type { Invoice } from '@/api/types';
++import { InvoicePreview } from './invoice-preview';
++
++const invoice: Invoice = {
++  id: 'inv_01JD7Q',
++  number: '0000000412',
++  totalCents: 150060,
++  vatCents: 25010,
++  lines: [
++    { description: 'Счетоводно обслужване, октомври 2026', baseCents: 100000, vatRateBp: 2000 },
++    { description: 'Подаване на справка-декларация по ЗДДС', baseCents: 25050, vatRateBp: 2000 },
++  ],
++};
++
++describe('InvoicePreview', () => {
++  it('shows the invoice total', () => {
++    render(<InvoicePreview invoice={invoice} />);
++    expect(screen.getByText('1 500,60 €')).toBeInTheDocument();
++  });
++});
