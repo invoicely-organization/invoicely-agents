@@ -5,4 +5,4 @@
 # Each agent gets its entry when its definition is added (INV-10, INV-17).
 # Change this file through a PR like any prompt; Yoan approves.
 prompt-engineer:
-  allow: []
+  allow: ["agents/**", "skills/**", "evals/**", "templates/**", "fixtures/eval-workspace/**", "policies/role-guard.yaml"]
