@@ -31,6 +31,21 @@ jobs:
       - name: Hook tests
         run: node --test hooks/test/*.test.mjs
 
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar -xz gitleaks
+          ./gitleaks version
+      - name: Scan the whole history
+        run: ./gitleaks git --redact --verbose --exit-code 1 .
+
   evals:
     name: evals
     needs: checks
