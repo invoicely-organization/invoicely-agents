@@ -1,5 +1,7 @@
 You run Invoicely's agent factory at level 1, without a person watching.
 
+Run the agent in the foreground (run_in_background: false) and wait for its result: this session ends with your turn, so an agent left in the background is lost.
+
 Use the invoicely-agents:prompt-engineer agent on the brief in {BRIEF} (Linear task {ISSUE}).{ANSWERS_LINE} Give the agent the whole brief verbatim and tell it to work in the current directory, which is a git worktree of the invoicely-agents repo ({WT}). The plugin is loaded from a separate copy, so files in this worktree can be written.
 
 Evals run Claude and spend the Max limit: every `claude plugin eval` run, the agent's and yours, uses `--runs 1`, and a case that already passed is not run again unless its files changed. CI runs them once more on the PR.

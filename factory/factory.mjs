@@ -300,6 +300,8 @@ function runClaude(args, cwd, logFile, identity) {
     let env = { ...process.env };
     if (config.nodeBin) env.PATH = `${config.nodeBin}:${env.PATH}`;
     if (identity) env = sessionEnv(env, identity);
+    // A headless session ends with its last turn: an agent left running in the background would be lost with it.
+    env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = '1';
     const child = spawn('claude', args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     const out = fs.createWriteStream(logFile, { flags: 'a' });
@@ -325,7 +327,7 @@ async function runTask(task, budgetCap) {
     let newSession = null;
     if (task.resumeSession) {
       const message = task.message || 'You stopped before finishing (usage limit or interruption). Continue exactly where you stopped and finish the same instructions.';
-      args = ['-p', message, '--resume', task.resumeSession, ...base];
+      args = ['-p', `${message}\n\n${FOREGROUND}`, '--resume', task.resumeSession, ...base];
     } else {
       const template = fs.readFileSync(path.join(HERE, 'prompts', 'prompt-engineer-task.md'), 'utf8');
       const prompt = fillTemplate(template, {
@@ -382,7 +384,8 @@ function parseTask(argv) {
   return task;
 }
 
-const INTERRUPTED = 'You were interrupted: the runner restarted or the Mac was turned off. Continue exactly where you stopped and finish the same instructions.';
+const FOREGROUND = 'Run every agent in the foreground (run_in_background: false) and wait for its result: this session ends with your turn, so an agent left in the background is lost.';
+const INTERRUPTED = `You were interrupted: the runner restarted or the Mac was turned off. Continue exactly where you stopped and finish the same instructions. ${FOREGROUND}`;
 const MAX_FIX_ROUNDS = 2;
 const CI_TIMEOUT_MINUTES = 150;
 
@@ -505,10 +508,14 @@ async function mergedByBase(queue) {
 }
 
 // A task whose dependency is neither merged nor in the queue would wait forever: it is taken out and Yoan is asked.
+// A dependency that waits for Yoan's answer (a question, a red CI) is not gone: its answer puts it back in the queue.
 async function dropBlocked(queue, merged) {
+  const last = new Map();
+  for (const e of readLedger()) if (['needs_answer', 'ci_failed', 'answered', 'merged', 'error', 'blocked', 'closed'].includes(e.status)) last.set(e.issue, e.status);
+  const waitingForYoan = (id) => ['needs_answer', 'ci_failed'].includes(last.get(id));
   for (const task of queue) {
     if (task.stage === 'ci') continue;
-    const missing = blockingDeps(task, merged.get(task.base || 'main') ?? new Set()).filter((dep) => !queue.some((q) => q.issue === dep));
+    const missing = blockingDeps(task, merged.get(task.base || 'main') ?? new Set()).filter((dep) => !queue.some((q) => q.issue === dep) && !waitingForYoan(dep));
     if (missing.length === 0) continue;
     const entry = { issue: task.issue, branch: task.branch, base: task.base || 'main', ended: new Date().toISOString(), status: 'blocked', blockedBy: missing };
     ledger(entry);
