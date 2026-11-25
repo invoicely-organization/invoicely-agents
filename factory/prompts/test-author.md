@@ -6,6 +6,8 @@ The task, as Yoan wrote it in Linear (Какво: what he wants; Как пров
 {TASK}
 </task>
 
+{DOCUMENTS}
+
 You work in {WT}, a git worktree of the {REPO} repo on the branch {BRANCH}, made from main. The plugin with your instructions loads from a separate copy.
 
 Write the tests for this task: at least one per check in "Как проверявам" and per criterion in the rest of the text, following your agent instructions. After you, the implementer writes the code in a separate session and may not change your tests; then the reviewer reads the PR.
