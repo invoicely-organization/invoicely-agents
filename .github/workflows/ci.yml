@@ -46,6 +46,42 @@ jobs:
       - name: Scan the whole history
         run: ./gitleaks git --redact --verbose --exit-code 1 .
 
+  # The reviewer agent reads every PR with a fresh context (INV-44). PASS lets it through; FAIL or QUESTION
+  # fails the check and the findings go into a PR comment. Skipped until a branch has agents/reviewer.md.
+  review:
+    name: review
+    needs: checks
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Claude Code
+        if: hashFiles('agents/reviewer.md') != ''
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Review
+        run: node scripts/review-pr.mjs "${{ github.event.pull_request.number }}" "${{ github.event.pull_request.base.sha }}"
+      - name: Keep the cost
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-cost
+          path: review-cost.json
+          if-no-files-found: ignore
+
   evals:
     name: evals
     needs: checks

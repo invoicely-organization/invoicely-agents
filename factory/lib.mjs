@@ -94,11 +94,13 @@ export function blockingDeps(task, merged) {
 
 export function fixMessage({ pr, failed, branch, base }) {
   const conflict = failed.some((f) => f.startsWith('merge conflict'));
+  const review = failed.includes('review');
   return [
     `CI failed on your PR ${pr}: ${failed.join(', ') || 'a required check'}.`,
     conflict
       ? `Another task was merged into ${base} first. Run git fetch origin and git merge origin/${base}, resolve the conflicts so that both sides' changes stay (for example both agents' entries in policies/role-guard.yaml), and do not drop the other task's work.`
       : `See why with: gh pr checks ${pr}   and   gh run view <run id> --log-failed`,
+    ...(review ? [`The reviewer agent did not pass it: read its findings with gh pr view ${pr} --comments and fix every blocking and critical one. A QUESTION you cannot answer from the brief: stop and end with the question.`] : []),
     'Fix only what this task changed. If a failing eval case is about another agent that this task did not change, do not change that agent or its cases: name the case and say so in your answer (INV-53).',
     `Fix it in this worktree, run the checks from your instructions again, then commit and git push to ${branch}.`,
     'Do not open a new PR and do not change the PR base.',
