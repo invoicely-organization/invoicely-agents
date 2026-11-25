@@ -56,15 +56,31 @@ test('a broken policy blocks every subagent write', () => {
   assert.match(result.reason, /cannot be read/);
 });
 
-test('the policy in this repo parses and lets prompt-engineer write prompts, not code', () => {
-  const write = (file) => runHook('role-guard.mjs', {
-    tool_name: 'Write', cwd: project, agent_id: 'a1', agent_type: 'invoicely-agents:prompt-engineer',
+test('the runner\'s role (INVOICELY_ROLE) limits the whole session, also without a subagent', () => {
+  const asRole = (role, file, agentType) => runHook('role-guard.mjs', {
+    tool_name: 'Write', cwd: project, ...(agentType ? { agent_id: 'a1', agent_type: agentType } : {}),
     tool_input: { file_path: path.join(project, file) },
-  }, { CLAUDE_PROJECT_DIR: project, INVOICELY_ROLE_GUARD_POLICY: '' });
-  assert.equal(write('agents/reviewer.md').denied, false);
-  assert.equal(write('evals/reviewer/regression-cell-17-vs-18/case.yaml').denied, false);
-  const code = write('hooks/role-guard.mjs');
-  assert.equal(code.denied, true);
-  assert.doesNotMatch(code.reason, /cannot be read/);
-  assert.equal(write('apps/api/src/main.ts').denied, true);
+  }, { ...env, INVOICELY_ROLE: role });
+  assert.equal(asRole('frontend-engineer', 'apps/web/src/x.ts').denied, false);
+  assert.equal(asRole('frontend-engineer', 'apps/web/src/x.test.ts').denied, true);
+  // A subagent of the session keeps the session's role.
+  assert.equal(asRole('reviewer', 'apps/web/src/x.ts', 'general-purpose').denied, true);
+});
+
+test('the policy in this repo: test-author writes tests only, implementer everything but tests, etalons locked for both', () => {
+  const write = (role, file) => runHook('role-guard.mjs', {
+    tool_name: 'Write', cwd: project, tool_input: { file_path: path.join(project, file) },
+  }, { CLAUDE_PROJECT_DIR: project, INVOICELY_ROLE_GUARD_POLICY: '', INVOICELY_ROLE: role });
+  assert.equal(write('test-author', 'packages/domain/src/vat/cells.test.ts').denied, false);
+  assert.equal(write('test-author', 'factory/test/review.test.mjs').denied, false);
+  assert.equal(write('test-author', 'packages/domain/src/vat/cells.ts').denied, true);
+  assert.equal(write('implementer', 'packages/domain/src/vat/cells.ts').denied, false);
+  assert.equal(write('implementer', 'factory/factory.mjs').denied, false);
+  const test = write('implementer', 'packages/domain/src/vat/cells.test.ts');
+  assert.equal(test.denied, true);
+  assert.doesNotMatch(test.reason, /cannot be read/);
+  assert.equal(write('implementer', 'factory/test/lib.test.mjs').denied, true);
+  assert.equal(write('implementer', 'policies/role-guard.yaml').denied, true);
+  assert.equal(write('implementer', '.github/workflows/ci.yml').denied, true);
+  for (const role of ['test-author', 'implementer', 'reviewer']) assert.equal(write(role, 'fixtures/etalons/vat/DEKLAR.txt').denied, true);
 });

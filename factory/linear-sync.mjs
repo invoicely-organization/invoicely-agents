@@ -1,21 +1,6 @@
-// Linear as the "go" button (INV-45): what the runner takes from Linear, as pure functions.
-// A task in Ready with a brief goes into the queue; a feature in Ready brings all its open subtasks, each with the
-// feature branch as base and its blockers among them as dependencies. Yoan's answer to a question resumes the session.
-
-// The <brief> block from the "Agent notes" of a Linear description, with Linear's markup turned back into plain text.
-export function extractBrief(description) {
-  const match = /<brief>[\s\S]*?<\/brief>/.exec(description ?? '');
-  if (!match) return null;
-  return match[0]
-    .replace(/<issue [^>]*label="([^"]+)"[^>]*\/>/g, '$1')
-    .replace(/<user [^>]*label="([^"]+)"[^>]*\/>/g, '$1')
-    .replace(/\\([*_[\]()#>`~-])/g, '$1')
-    .replace(/\n {2}<\//g, '\n</');
-}
-
-export function briefRole(brief) {
-  return /<task[^>]*\brole="([^"]+)"/.exec(brief ?? '')?.[1] ?? null;
-}
+// What the runner takes from Linear, as pure functions. A task Yoan moves to Ready is the "go": it goes into the queue
+// as it is (Какво, Как проверявам, Agent notes), unless a task that blocks it is still open. Its labels say the repo
+// (invoicely-agents, otherwise invoicely) and whether it ends with Yoan's check of the UI (UI).
 
 // Linear's branch name without the user prefix: "yoansvdimitrov/inv-45-runner-t-vzima" becomes "inv-45-runner-t-vzima".
 export function branchName(issue) {
@@ -25,42 +10,55 @@ export function branchName(issue) {
 
 const OPEN = (state) => !['completed', 'canceled', 'duplicate'].includes(state?.type);
 
-// Blockers of an issue: the issues that "block" it, still open.
+// The tasks that block an issue ("blocked by" in Linear) and are still open.
 export function openBlockers(issue) {
   return (issue.inverseRelations?.nodes ?? [])
     .filter((r) => r.type === 'blocks' && OPEN(r.issue?.state))
     .map((r) => r.issue.identifier);
 }
 
-// What to queue for the issues Yoan put in Ready. Returns { add: [...tasks], skip: [...{ issue, why }] }.
-// A task the runner cannot run (no brief, or a role it does not run yet) stays in Ready for Claude, who looks at
-// Ready on every check: Ready means "go" for Yoan whoever does the work. known: ids already queued or running.
-export function planFromReady(readyIssues, known, briefPath) {
-  const add = [];
-  const skip = [];
-  const take = (issue, base, siblings) => {
-    if (known.has(issue.identifier) || add.some((t) => t.issue === issue.identifier)) return;
-    const brief = extractBrief(issue.description);
-    if (!brief) return skip.push({ issue: issue.identifier, why: 'no brief: for Claude' });
-    if (briefRole(brief) !== 'prompt-engineer') {
-      return skip.push({ issue: issue.identifier, why: `role "${briefRole(brief) ?? 'none'}" is not run by the runner yet: for Claude` });
-    }
-    const deps = openBlockers(issue).filter((id) => siblings.has(id));
-    add.push({ issue: issue.identifier, branch: branchName(issue), brief: briefPath(issue.identifier), briefText: brief, base, ...(deps.length ? { dependsOn: deps } : {}) });
-  };
-  for (const issue of readyIssues) {
-    const children = (issue.children?.nodes ?? []).filter((c) => OPEN(c.state));
-    if (children.length) {
-      const siblings = new Set(children.map((c) => c.identifier));
-      for (const child of children) take(child, `feature/${issue.identifier}`, siblings);
-    } else {
-      take(issue, issue.parent ? `feature/${issue.parent.identifier}` : 'main', new Set());
-    }
-  }
-  return { add, skip };
+const labels = (issue) => (issue.labels?.nodes ?? []).map((l) => l.name.toLowerCase());
+
+export function taskRepo(issue) {
+  return labels(issue).includes('invoicely-agents') ? 'invoicely-agents' : 'invoicely';
 }
 
-// Yoan's answer after the agent's question: his comments newer than the question, not written by the runner.
+export function needsUiCheck(issue) {
+  return labels(issue).includes('ui');
+}
+
+// The task for the agents: its title and description, with Linear's markup turned back into plain text.
+export function taskText(issue) {
+  const description = (issue.description ?? '')
+    .replace(/<issue [^>]*label="([^"]+)"[^>]*\/>/g, '$1')
+    .replace(/<user [^>]*label="([^"]+)"[^>]*\/>/g, '$1')
+    .replace(/<pull-request [^>]*label="([^"]+)"[^>]*\/>/g, 'PR "$1"')
+    .replace(/^>>>\s*/gm, '')
+    .replace(/\\([*_[\]()#>`~-])/g, '$1');
+  return `# ${issue.identifier}: ${issue.title}\n\n${description.trim()}\n`;
+}
+
+// What to queue for the issues in Ready. Returns { add: [...tasks], wait: [...{ issue, why }] }.
+// known: ids already queued or running.
+export function planFromReady(readyIssues, known) {
+  const add = [];
+  const wait = [];
+  for (const issue of readyIssues) {
+    if (known.has(issue.identifier)) continue;
+    const blockers = openBlockers(issue);
+    if (blockers.length) {
+      wait.push({ issue: issue.identifier, why: `blocked by ${blockers.join(', ')}` });
+      continue;
+    }
+    add.push({
+      issue: issue.identifier, title: issue.title, repo: taskRepo(issue), ui: needsUiCheck(issue),
+      branch: branchName(issue), text: taskText(issue),
+    });
+  }
+  return { add, wait };
+}
+
+// Yoan's answer after the runner's question: his comments newer than the question.
 export function answerAfter(comments, yoanId, since) {
   const runner = /^(\[@[^\]]*\]\([^)]*\)\s*)?\*\*(Чака|Готово|Слято|Грешка|Спрян)/;
   const answers = (comments ?? [])

@@ -1,18 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { answerAfter, branchName, extractBrief, openBlockers, planFromReady } from '../linear-sync.mjs';
+import { answerAfter, branchName, openBlockers, planFromReady, taskText } from '../linear-sync.mjs';
 
-const brief = (role = 'prompt-engineer') => `## Цел\n\nx\n\n>>> Agent notes\n\n<brief>\n<task role="${role}">\nDo it, see <issue id="1" label="INV-42" href="h" />.\n</task>\n<scope>\n<in>evals/orchestrator/\\*\\*</in>\n</scope>\n  </brief>\n\n>>>`;
 const done = { type: 'completed' };
 const open = { type: 'unstarted' };
-
-test('the brief is the <brief> block with Linear markup turned back into text', () => {
-  const text = extractBrief(brief());
-  assert.match(text, /^<brief>/);
-  assert.match(text, /<\/brief>$/);
-  assert.match(text, /see INV-42\./);
-  assert.match(text, /evals\/orchestrator\/\*\*/);
-  assert.equal(extractBrief('## Цел\nno notes'), null);
+const issue = (id, extra = {}) => ({
+  identifier: id, title: `Задача ${id}`, gitBranchName: `yoan/${id.toLowerCase()}-x`,
+  description: '## Какво\n\nx\n\n## Как проверявам\n\ny, виж <issue id="1" label="INV-42" href="h" />\n\n>>> Agent notes\n\n* \\*\\*z\\*\\*\n\n>>>',
+  labels: { nodes: [] }, inverseRelations: { nodes: [] }, ...extra,
 });
 
 test('branch names drop the Linear user prefix', () => {
@@ -20,48 +15,34 @@ test('branch names drop the Linear user prefix', () => {
   assert.equal(branchName({ identifier: 'INV-7' }), 'inv-7');
 });
 
-test('a feature in Ready queues its open subtasks on its feature branch, with blockers among them as dependencies', () => {
-  const feature = {
-    identifier: 'INV-10', description: '',
-    children: { nodes: [
-      { identifier: 'INV-31', gitBranchName: 'y/inv-31-reviewer', description: brief(), state: open },
-      { identifier: 'INV-34', gitBranchName: 'y/inv-34-orch', description: brief(), state: open,
-        inverseRelations: { nodes: [
-          { type: 'blocks', issue: { identifier: 'INV-31', state: open } },
-          { type: 'blocks', issue: { identifier: 'INV-24', state: done } },
-          { type: 'related', issue: { identifier: 'INV-43', state: open } },
-        ] } },
-      { identifier: 'INV-9', description: brief(), state: done },
-    ] },
-  };
-  const { add, skip } = planFromReady([feature], new Set(), (id) => `/b/${id}.md`);
-  assert.deepEqual(skip, []);
-  assert.deepEqual(add.map((t) => [t.issue, t.base, t.branch, t.dependsOn ?? []]), [
-    ['INV-31', 'feature/INV-10', 'inv-31-reviewer', []],
-    ['INV-34', 'feature/INV-10', 'inv-34-orch', ['INV-31']],
+test('the task for the agents is its title and description, with Linear markup turned back into text', () => {
+  const text = taskText(issue('INV-70'));
+  assert.match(text, /^# INV-70: Задача INV-70/);
+  assert.match(text, /## Как проверявам/);
+  assert.match(text, /виж INV-42/);
+  assert.match(text, /\*\*z\*\*/);
+  assert.doesNotMatch(text, />>>/);
+});
+
+test('every task in Ready is queued: the product repo by default, invoicely-agents and UI by label', () => {
+  const { add, wait } = planFromReady([
+    issue('INV-70'),
+    issue('INV-71', { labels: { nodes: [{ name: 'invoicely-agents' }] } }),
+    issue('INV-72', { labels: { nodes: [{ name: 'UI' }] } }),
+  ], new Set());
+  assert.deepEqual(wait, []);
+  assert.deepEqual(add.map((t) => [t.issue, t.repo, t.ui, t.branch]), [
+    ['INV-70', 'invoicely', false, 'inv-70-x'], ['INV-71', 'invoicely-agents', false, 'inv-71-x'], ['INV-72', 'invoicely', true, 'inv-72-x'],
   ]);
-  assert.equal(add[0].brief, '/b/INV-31.md');
 });
 
-test('a single task goes to its parent feature branch or to main; known tasks are left alone', () => {
-  const lone = { identifier: 'INV-45', description: brief(), children: { nodes: [] } };
-  const child = { identifier: 'INV-40', description: brief(), parent: { identifier: 'INV-10' }, children: { nodes: [] } };
-  const { add } = planFromReady([lone, child, { identifier: 'INV-33', description: brief() }], new Set(['INV-33']), (id) => id);
-  assert.deepEqual(add.map((t) => [t.issue, t.base]), [['INV-45', 'main'], ['INV-40', 'feature/INV-10']]);
-});
-
-test('a task without a brief, or for a role the runner does not run yet, stays in Ready for Claude', () => {
-  const { add, skip } = planFromReady([
-    { identifier: 'INV-6', description: 'Йоан решава' },
-    { identifier: 'INV-12', description: brief('devops') },
-  ], new Set(), (id) => id);
-  assert.deepEqual(add, []);
-  assert.deepEqual(skip.map((a) => a.issue), ['INV-6', 'INV-12']);
-  assert.match(skip[1].why, /devops/);
-});
-
-test('blockers are only the open issues that block this one', () => {
-  assert.deepEqual(openBlockers({ inverseRelations: { nodes: [{ type: 'blocks', issue: { identifier: 'A', state: open } }, { type: 'blocks', issue: { identifier: 'B', state: done } }] } }), ['A']);
+test('a task blocked by an open one stays in Ready until it is free; known tasks are left alone', () => {
+  const blocked = issue('INV-71', { inverseRelations: { nodes: [{ type: 'blocks', issue: { identifier: 'INV-70', state: open } }] } });
+  const free = issue('INV-72', { inverseRelations: { nodes: [{ type: 'blocks', issue: { identifier: 'INV-69', state: done } }] } });
+  const { add, wait } = planFromReady([blocked, free, issue('INV-73')], new Set(['INV-73']));
+  assert.deepEqual(add.map((t) => t.issue), ['INV-72']);
+  assert.deepEqual(wait, [{ issue: 'INV-71', why: 'blocked by INV-70' }]);
+  assert.deepEqual(openBlockers(blocked), ['INV-70']);
 });
 
 test("Yoan's answer is his comments after the question, without the runner's own", () => {

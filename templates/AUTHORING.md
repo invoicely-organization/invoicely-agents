@@ -1,14 +1,14 @@
 # How we write agent prompts
 
-Every prompt is code: it lives in this repo, changes only through a PR and has tests (evals). An agent whose evals fail is not used.
+Every prompt is code: it lives in this repo and changes only through a PR, like any code. Its evals are run by hand when they help; CI does not run them.
 
 ## Three kinds of prompts
 
-| Prompt | Template | Written by | Checked by |
+| Prompt | Where | Written by | Checked by |
 | --- | --- | --- | --- |
-| Agent definition | `templates/agent.md` | prompt-engineer; Yoan approves | evals in `evals/<agent>/`, `claude plugin validate` |
-| Task | Linear issue template "Таск" | planner | readiness check, step 1 of the task pipeline |
-| Brief | `templates/brief.md` | orchestrator | the reviewer checks the result against the brief; the ledger counts returned briefs |
+| Agent definition | `agents/<agent>.md`, from `templates/agent.md` | a task in Linear, like any code | the reviewer in CI, `claude plugin validate`, evals by hand |
+| Session prompt | `factory/prompts/<role>.md` | a task in Linear | the same |
+| Task | Linear issue template "Таск": Какво, Как проверявам, Agent notes | Yoan | test-author turns "Как проверявам" into tests |
 
 ## Writing rules
 
@@ -21,7 +21,7 @@ Every prompt is code: it lives in this repo, changes only through a PR and has t
 7. Structure with the XML tags from the template, always in the same order.
 8. Enforce permissions with tools, disallowedTools and hooks, not with words. "Do not edit tests" in a prompt is a wish; a denied write on tests is a rule.
 9. One agent, one job. If the description needs "and", consider two agents.
-10. The description says exactly when to use the agent, because the orchestrator picks agents by it.
+10. The description says exactly when to use the agent, because sessions pick subagents by it.
 
 ## Evals
 
@@ -68,7 +68,6 @@ Use `--runs 1` while writing a case and the case's own `runs` (3) before merge. 
 
 ## Changing a prompt
 
-1. Open a Linear issue that describes the wrong behaviour and links the run or ledger entry.
-2. prompt-engineer edits the definition and adds or updates the eval case that shows the failure.
-3. CI runs `claude plugin validate` and the agent's evals (the command above).
-4. Yoan approves the PR.
+1. A Linear task (label invoicely-agents) that describes the wrong behaviour and links the run or ledger entry.
+2. The task goes through the process like any other: test-author, implementer, the reviewer in CI.
+3. Run the agent's evals by hand (the command above) when the change is about its behaviour.

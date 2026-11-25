@@ -4,7 +4,6 @@ on:
   pull_request:
   push:
     branches: [main]
-  workflow_dispatch: # by hand: the whole eval suite
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -46,100 +45,12 @@ jobs:
       - name: Scan the whole history
         run: ./gitleaks git --redact --verbose --exit-code 1 .
 
-  # The reviewer agent reads every PR with a fresh context (INV-44). PASS lets it through; FAIL or QUESTION
-  # fails the check and the findings go into a PR comment. Skipped until a branch has agents/reviewer.md.
+  # The reviewer agent reads every PR into main with a fresh context (INV-64): the shared workflow in review.yml.
   review:
-    name: review
     needs: checks
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
     permissions:
       contents: read
       pull-requests: write
-    env:
-      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - name: Install Claude Code
-        if: hashFiles('agents/reviewer.md') != ''
-        run: |
-          curl -fsSL https://claude.ai/install.sh | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: Review
-        run: node scripts/review-pr.mjs "${{ github.event.pull_request.number }}" "${{ github.event.pull_request.base.sha }}"
-      - name: Keep the cost
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: review-cost
-          path: review-cost.json
-          if-no-files-found: ignore
-
-  evals:
-    name: evals
-    needs: checks
-    if: github.event_name != 'push'
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    env:
-      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - name: Install Claude Code and the sandbox tools
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap socat
-          curl -fsSL https://claude.ai/install.sh | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: Pick the agents to evaluate
-        id: pick
-        run: |
-          if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
-            echo "::warning::CLAUDE_CODE_OAUTH_TOKEN is not set, so the evals are skipped."
-            echo "agents=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            agents="$(scripts/changed-agents.sh "${{ github.event.pull_request.base.sha }}" | tr '\n' ' ')"
-          else
-            agents="$(find agents -maxdepth 1 -name '*.md' | sed -E 's#^agents/(.*)\.md$#\1#' | tr '\n' ' ')"
-          fi
-          echo "agents=$agents" >> "$GITHUB_OUTPUT"
-          echo "Agents to evaluate: ${agents:-none}"
-      # The evals run Claude on the Max plan, so they are rationed: once per case on a subtask PR into a
-      # feature branch, three times only on the PR into main that Yoan approves. A case without a majority of
-      # passing runs is run again until it has three and passes with two (INV-62). The script is taken from the
-      # PR's base when the base has it, so a PR cannot change its own verdict.
-      - name: Run the evals
-        if: steps.pick.outputs.agents != ''
-        env:
-          RUNS: ${{ github.base_ref == 'main' && '3' || '1' }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          script=scripts/run-evals.mjs
-          if [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA:scripts/run-evals.mjs" 2>/dev/null; then
-            git show "$BASE_SHA:scripts/run-evals.mjs" > "$RUNNER_TEMP/run-evals.mjs"
-            script="$RUNNER_TEMP/run-evals.mjs"
-          fi
-          node "$script" --runs "$RUNS" ${{ steps.pick.outputs.agents }}
-      - name: Eval cost
-        if: always() && steps.pick.outputs.agents != ''
-        run: node scripts/eval-cost.mjs evals/results >> "$GITHUB_STEP_SUMMARY"
-      - name: Keep the reports
-        if: always() && steps.pick.outputs.agents != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: eval-results
-          path: evals/results/
-          if-no-files-found: ignore
+    uses: ./.github/workflows/review.yml
+    secrets: inherit

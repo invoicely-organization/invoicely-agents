@@ -1,74 +1,73 @@
 #!/usr/bin/env node
-// The factory runner: one queue for the agent sessions on the Mac, with a spending cap per run,
-// one session per task, a night window, and automatic resume after the usage limit resets.
-// Ideas taken from Paperclip (budgets, heartbeats, atomic checkout, audit log).
+// The runner: from a task in Linear to a merged PR with a review and a summary (INV-64, the document "Процесът").
 //
-//   factory queue add <INV-xx> --branch <b> --brief <file> [--answers <file>] [--budget <usd>] [--add-dir <dir>]
-//                              [--resume-session <id> --message <text>]
-//   factory queue run [--now]     run the queue, one task at a time, in the night window unless --now
-//   factory run <INV-xx> ...      run one task now (same options as queue add)
-//   factory status                queue, locks, GitHub identity and the last runs
+//   1. A task Yoan moves to Ready goes into the queue, unless a task that blocks it is still open.
+//   2. test-author writes the tests in its own session; the runner commits them. Then the implementer, in another
+//      session, writes the code until they pass; the runner commits, pushes and opens the PR to main. The role guard
+//      locks the tests for the implementer and the code for test-author, and the runner checks every session's diff.
+//      A test the implementer calls wrong goes back to test-author with the reason.
+//   3. The reviewer reads the PR in CI (the review job) and writes a GitHub review, inline where it can.
+//   4. Findings or a red CI: the implementer fixes them in the same PR and the reviewer looks again. After 3 rounds
+//      the task goes to "Чака Йоан" with the question. An exhausted Max limit is not a failure: the step waits and
+//      runs again after the reset.
+//   5. Reviewer PASS and green CI: the runner merges.
+//   6. The summary goes into the task; a task labelled UI goes to "Чака Йоан" for Yoan's check, the others to Done.
 //
-// With githubApp set in ~/.invoicely/config.json and the key in ~/.invoicely/github-app.pem, the sessions commit,
-// push and open PRs as the App bot (see github-app.mjs). Without them they act as Yoan.
+//   factory queue run              the runner (launchd runs it as com.invoicely.runner)
+//   factory status                 the queue, locks and the last runs
+//   factory pause [--wait] | resume
+//   factory requeue <INV-xx> [--message <text>]   put back a task that waits for Yoan, without his answer in Linear
+//   factory clean [--dry-run]      copies and branches of finished tasks
+//   factory linear ask|comment <INV-xx> --body-file <file> | factory linear state <INV-xx> <state>
+//   factory service install|uninstall|status
 import { execFileSync, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { appSettings, installationToken, sessionEnv, writeGhConfig, writeTokenFile } from './github-app.mjs';
+import { mergeInProgress, policyViolations, unmergedFiles } from './git-check.mjs';
+import { appSettings, installationToken, sessionEnv, writeGhConfig } from './github-app.mjs';
+import { cleanupSummary, oldLogs, parseWorktrees, planCleanup } from './janitor.mjs';
 import { linearClient, mention } from './linear.mjs';
 import { answerAfter, planFromReady } from './linear-sync.mjs';
-import { cleanupSummary, oldLogs, parseWorktrees, planCleanup } from './janitor.mjs';
-import { alreadyUpdated, copyMatchesPr, mergeBaseInto } from './update-branch.mjs';
 import {
-  blockingDeps, checksVerdict, classify, conflictOnly, failedChecks, fixPrecheck, fillTemplate, findPrUrl, fixMessage, inWindow, isFeatureBranch,
-  budgetAnswer, entryCosts, featurePrBody, featureReady, minutesBetween, nextRunnable, nextWindowStart, nightReport, nightStart, parseLimitReset, parseResult,
-  servicePlist, sessionBudget, sessionDirName, shouldRerunEvals, spendingPeriod, spentSince, statusAction, taskSpent,
+  budgetAnswer, classify, entryCosts, fillTemplate, findingLines, fixMessage, isReviewCheck, minutesBetween, nextRunnable,
+  parseOutcome, parseResult, retryAt, reviewDecision, reviewText, servicePlist, statusAction, summaryBody, taskCost,
 } from './lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOME = os.homedir();
 const STATE = process.env.INVOICELY_HOME || path.join(HOME, '.invoicely');
+const AGENTS_REPO = path.join(HOME, 'projects', 'invoicely-agents');
 const config = {
-  repo: path.join(HOME, 'projects/invoicely-agents'),
-  // New task copies live in the repo's .claude/worktrees, the place `claude -w` uses (INV-48); a task that began in
-  // the old folder keeps its copy there until it ends, because its session resumes by path.
-  worktrees: path.join(HOME, 'projects/invoicely-agents/.claude/worktrees'),
-  legacyWorktrees: path.join(HOME, 'projects/ia-wt'),
+  // The repos the agents work in; a task's Linear label picks one (see linear-sync.mjs).
+  repos: { invoicely: path.join(HOME, 'projects', 'invoicely'), 'invoicely-agents': AGENTS_REPO },
   // The plugin loads from its own copy, outside the repo: Claude Code refuses edits to every file under a loaded
-  // plugin's folder, and the task copies live inside the repo (checked on 25.11, INV-49). It is runner state.
+  // plugin's folder, and the task copies live inside the repo (INV-49).
   plugin: path.join(STATE, 'plugin'),
   pluginRef: 'origin/main',
-  budgetUsd: 15, // API dollars a task's sessions may spend over all their runs; a task's own budgetUsd overrides it
-  windowStart: 22,
-  windowEnd: 8,
+  budgetUsd: 15, // API dollars a task's sessions may spend; then it asks Yoan
   nodeBin: '',
-  nightBudgetUsd: 60, // API dollars a night may spend on sessions and CI evals; then the runner stops until the next night
-  dayBudgetUsd: 20, // the same for the day between two nights, when the runner is started with --now
-  reportProjectId: 'a2abfb0c-4d55-41a7-8719-3838050c6d0c', // Linear project "M0 Инфраструктура": the night report goes there
+  linearTeam: 'INV',
   ...readJson(path.join(STATE, 'config.json'), {}),
 };
-// The bot token of each running agent session, outside STATE, which the sandbox does not let sessions read (INV-57).
-const SESSIONS = process.env.INVOICELY_SESSIONS || path.join(HOME, '.invoicely-session');
-// The sandbox of the agent sessions (INV-57): their Bash commands and everything those start may not read the
-// runner's state, SSH, gh, AWS, Docker or git credentials or the Keychain (checked on 25.11: without
-// ~/Library/Keychains in the list, `security` reads Keychain items from inside the sandbox), and reach only GitHub and
-// npm. trustd is for gh's TLS. `claude plugin eval` runs outside it: its claude processes need the Claude login in
-// the Keychain and /tmp. allowUnsandboxedCommands false: the model cannot ask to leave the sandbox.
+// The sandbox of the agent sessions (INV-57): their Bash commands may not read the runner's state, SSH, gh, AWS,
+// Docker or git credentials or the Keychain, and reach only GitHub and npm.
 const SANDBOX = path.join(HERE, 'sandbox.json');
 const QUEUE = path.join(STATE, 'queue.json');
 const LEDGER = path.join(STATE, 'ledger', 'runs.jsonl');
-for (const dir of ['locks', 'ledger', 'logs']) fs.mkdirSync(path.join(STATE, dir), { recursive: true });
-
-// --- The runner as a service (INV-49) ---
-
-// While this file exists the runner starts nothing: no session, no CI merge, no clean-up. `factory pause` lets the
-// running session finish first, so that the copies can be worked on safely; `factory resume` goes on.
 const PAUSED = path.join(STATE, 'paused');
-// The runner runs from the main checkout, which stays on main and which nobody works in.
-const RUNS_FROM_REPO = path.resolve(path.dirname(HERE)) === path.resolve(config.repo);
+for (const dir of ['locks', 'ledger', 'logs', 'briefs']) fs.mkdirSync(path.join(STATE, dir), { recursive: true });
+
+const MAX_ROUNDS = 3; // review rounds before the task goes to Yoan
+const MAX_DISPUTES = 2; // times a test may go back to test-author before Yoan decides
+const MAX_LIMIT_WAITS = 8; // limit resets waited for in a row before Yoan is told ("Credit balance is too low" may not reset)
+const MAX_REVIEW_ERRORS = 5; // rounds in a row in which GitHub or git failed on a PR before Yoan is told
+const REVIEW_TIMEOUT_MINUTES = 150;
+
+// The runner runs from the main checkout of invoicely-agents, which stays on main and which nobody works in.
+const RUNS_FROM_REPO = path.resolve(path.dirname(HERE)) === path.resolve(AGENTS_REPO);
 let startCommit = null;
 try {
   startCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: path.dirname(HERE), stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
@@ -76,17 +75,16 @@ try {
   // not a git checkout: no self-update
 }
 
-const ALLOWED_TOOLS = [
+// What the sessions may run. They do not commit, merge, push or open PRs: the runner does, as the bot.
+const COMMON_TOOLS = [
   'Agent', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
-  // node only for tests and the repo's own scripts, not `node -e`; no cat: Read does that and the secret guard
-  // checks it (INV-51). factory/ is the runner's, not the agents'.
-  'Bash(claude plugin validate:*)', 'Bash(claude plugin eval:*)', 'Bash(node --test:*)', 'Bash(node --check:*)',
-  // The * form: on 25.11 `Bash(node scripts/:*)` refused `node scripts/x.mjs`, `Bash(node scripts/*)` allowed it.
-  'Bash(node scripts/*)', 'Bash(node hooks/*)', 'Bash(node evals/*)',
-  'Bash(git status:*)', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git add:*)', 'Bash(git commit:*)', 'Bash(git push:*)',
-  'Bash(gh pr create:*)', 'Bash(gh pr view:*)', 'Bash(gh pr checks:*)', 'Bash(gh run view:*)', 'Bash(gh run list:*)',
-  'Bash(git fetch:*)', 'Bash(git merge:*)', 'Bash(ls:*)', 'Bash(mkdir:*)', 'Bash(chmod:*)',
+  'Bash(git status:*)', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git show:*)', 'Bash(ls:*)', 'Bash(mkdir:*)',
 ];
+const REPO_TOOLS = {
+  // The * form: on 25.11 `Bash(node scripts/:*)` refused `node scripts/x.mjs`, `Bash(node scripts/*)` allowed it.
+  'invoicely-agents': ['Bash(node --test:*)', 'Bash(node --check:*)', 'Bash(claude plugin validate:*)', 'Bash(node scripts/*)', 'Bash(node hooks/*)'],
+  invoicely: ['Bash(pnpm:*)', 'Bash(node --test:*)', 'Bash(npx tsc:*)', 'Bash(npx vitest:*)', 'Bash(npx eslint:*)', 'Bash(npx playwright:*)'],
+};
 
 function readJson(file, fallback) {
   try {
@@ -100,22 +98,68 @@ function log(message) {
   process.stdout.write(`${new Date().toISOString()} ${message}\n`);
 }
 
-function git(cwd, args) {
-  return execFileSync('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
+// The same line every round says nothing new: a state is logged once.
+const loggedOnce = new Set();
+function logOnce(key, message) {
+  if (loggedOnce.has(key)) return;
+  loggedOnce.add(key);
+  log(message);
 }
+
+function git(cwd, args, env) {
+  return execFileSync('git', args, { cwd, env: env ?? process.env, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }).toString().trim();
+}
+
+const gitZ = (cwd, args) => execFileSync('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }).toString().split('\0').filter(Boolean);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function sleepUntil(when) {
-  log(`waiting until ${when.toString()}`);
-  while (Date.now() < when.getTime()) await sleep(Math.min(when.getTime() - Date.now(), 5 * 60 * 1000));
+
+// --- The queue and the ledger ---
+
+function readQueue() {
+  return readJson(QUEUE, []);
 }
 
-// The plugin loads from its own copy: Claude Code refuses edits to a loaded plugin's files.
+function writeQueue(queue) {
+  fs.writeFileSync(QUEUE, JSON.stringify(queue, null, 2));
+}
+
+// Change one queue item by its task id; null removes it. The file is re-read, so edits made meanwhile stay.
+function updateItem(issue, change) {
+  const queue = readQueue();
+  const at = queue.findIndex((t) => t.issue === issue);
+  if (at === -1) return;
+  if (change === null) queue.splice(at, 1);
+  else {
+    queue[at] = { ...queue[at], ...change };
+    for (const key of Object.keys(queue[at])) if (queue[at][key] === undefined) delete queue[at][key];
+  }
+  writeQueue(queue);
+}
+
+function ledger(entry) {
+  fs.appendFileSync(LEDGER, `${JSON.stringify({ ended: new Date().toISOString(), ...entry })}\n`);
+}
+
+function readLedger() {
+  if (!fs.existsSync(LEDGER)) return [];
+  return fs.readFileSync(LEDGER, 'utf8').split('\n').filter(Boolean).flatMap((line) => {
+    try {
+      return [JSON.parse(line)];
+    } catch {
+      return [];
+    }
+  });
+}
+
+// --- Copies, the plugin and GitHub ---
+
+// The plugin loads from its own copy at origin/main: a PR cannot change the agents that work on it.
 function ensureRuntime() {
   const runtime = config.plugin;
   if (!fs.existsSync(runtime)) {
-    git(config.repo, ['fetch', '-q', 'origin']);
-    git(config.repo, ['worktree', 'add', '-q', '--detach', runtime, config.pluginRef]);
+    git(AGENTS_REPO, ['fetch', '-q', 'origin']);
+    git(AGENTS_REPO, ['worktree', 'add', '-q', '--detach', runtime, config.pluginRef]);
   } else {
     git(runtime, ['fetch', '-q', 'origin']);
     git(runtime, ['checkout', '-q', '--detach', config.pluginRef]);
@@ -123,44 +167,47 @@ function ensureRuntime() {
   return runtime;
 }
 
-// A task's copy lives as long as the task (INV-48): the queue item and every ledger entry keep its path.
-function taskCopyPath(task) {
-  if (task.worktree) return task.worktree;
-  const legacy = path.join(config.legacyWorktrees, task.branch);
-  return fs.existsSync(legacy) ? legacy : path.join(config.worktrees, task.branch);
-}
+const repoDir = (task) => config.repos[task.repo] ?? config.repos.invoicely;
+// The task's copy is one of Claude Code's own worktrees in the repo, .claude/worktrees/<branch> (in .gitignore). It
+// lives as long as the task: the runner removes it after the merge.
+const copyPath = (task) => path.join(repoDir(task), '.claude', 'worktrees', task.branch);
 
-// A new task branch starts from its base as it is now: for a subtask, the feature branch with every merged subtask.
-function ensureWorktree(task, base = 'main') {
-  const branch = task.branch;
-  const wt = taskCopyPath(task);
+function ensureWorktree(task) {
+  const wt = copyPath(task);
   if (fs.existsSync(wt)) return wt;
+  const repo = repoDir(task);
   fs.mkdirSync(path.dirname(wt), { recursive: true });
-  git(config.repo, ['fetch', '-q', 'origin']);
+  git(repo, ['fetch', '-q', 'origin']);
   try {
-    git(config.repo, ['worktree', 'add', '-q', wt, branch]);
+    git(repo, ['worktree', 'add', '-q', wt, task.branch]);
   } catch {
-    git(config.repo, ['worktree', 'add', '-q', '-b', branch, wt, `origin/${base}`]);
+    git(repo, ['worktree', 'add', '-q', '-b', task.branch, wt, 'origin/main']);
   }
   return wt;
 }
 
-// --- Feature branches (INV-43) ---
+function repoSlug(repo) {
+  return /github\.com[:/](.+?)(?:\.git)?$/.exec(git(repo, ['remote', 'get-url', 'origin']))?.[1];
+}
 
-// gh for the runner itself; asBot runs it as the GitHub App bot (merges), otherwise as Yoan (reads).
-async function gh(args, { asBot = false, json = false } = {}) {
-  let env = { ...process.env };
-  if (asBot) {
-    const app = appSettings(STATE);
-    if (app) {
-      const ghConfigDir = path.join(STATE, 'gh-bot');
-      writeGhConfig(ghConfigDir, await installationToken(app), app.slug);
-      env = sessionEnv(env, { slug: app.slug, botUserId: app.botUserId, ghConfigDir, helperCommand: '' });
-    }
-  }
+// The bot's environment for the runner's own git and gh: commits, pushes, PRs and merges go out as the GitHub App.
+async function botEnv() {
+  const app = appSettings(STATE);
+  if (!app) return { ...process.env };
+  const ghConfigDir = path.join(STATE, 'gh-bot');
+  writeGhConfig(ghConfigDir, await installationToken(app), app.slug);
+  return sessionEnv({ ...process.env }, {
+    slug: app.slug, botUserId: app.botUserId, ghConfigDir,
+    helperCommand: `!'${process.execPath}' '${path.join(HERE, 'github-app.mjs')}' git-credential`,
+  });
+}
+
+// gh for the runner; asBot as the GitHub App, otherwise as Yoan (reads, and reruns the App may not do).
+async function gh(args, { asBot = false, json = false, cwd = AGENTS_REPO } = {}) {
+  const env = asBot ? await botEnv() : { ...process.env };
   let out;
   try {
-    out = execFileSync('gh', args, { cwd: config.repo, env, stdio: ['ignore', 'pipe', 'pipe'] }).toString();
+    out = execFileSync('gh', args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }).toString();
   } catch (error) {
     // gh pr checks exits with 8 while checks run and 1 when one failed, and still prints the JSON.
     out = error.stdout?.toString() ?? '';
@@ -169,139 +216,30 @@ async function gh(args, { asBot = false, json = false } = {}) {
   return json ? JSON.parse(out) : out.trim();
 }
 
-function ensureBase(base) {
-  if (!isFeatureBranch(base)) return;
-  git(config.repo, ['fetch', '-q', 'origin']);
-  if (git(config.repo, ['ls-remote', '--heads', 'origin', base])) return;
-  git(config.repo, ['push', '-q', 'origin', `origin/main:refs/heads/${base}`]);
-  log(`created ${base} from main`);
-}
+// --- The role guard after every session ---
 
-// Tasks already merged into a base: from the ledger, and from GitHub for PRs merged by hand.
-async function mergedInto(base) {
-  const merged = new Set();
-  if (fs.existsSync(LEDGER)) {
-    for (const line of fs.readFileSync(LEDGER, 'utf8').trim().split('\n')) {
-      try {
-        const r = JSON.parse(line);
-        if (r.status === 'merged' && r.base === base) merged.add(r.issue);
-      } catch {
-        // a broken line does not stop the runner
-      }
-    }
-  }
-  try {
-    for (const pr of await gh(['pr', 'list', '--base', base, '--state', 'merged', '--limit', '200', '--json', 'title'], { json: true })) {
-      const match = /^(INV-\d+):/.exec(pr.title);
-      if (match) merged.add(match[1]);
-    }
-  } catch (error) {
-    log(`github: ${error.message}`);
-  }
-  return merged;
-}
+// The runner's own git never runs hooks: nothing a session wrote may run with the bot's token.
+const NO_HOOKS = ['-c', 'core.hooksPath=/dev/null'];
 
-// The PR of a finished subtask: point it at the feature branch, then merge it there when CI is green.
-async function advanceCi(item) {
-  const view = await gh(['pr', 'view', item.pr, '--json', 'state,baseRefName,mergeable'], { json: true });
-  if (view.state === 'MERGED') return { verdict: 'merged' };
-  if (view.state === 'CLOSED') return { verdict: 'closed' };
-  if (view.baseRefName !== item.base) {
-    await gh(['pr', 'edit', item.pr, '--base', item.base], { asBot: true });
-    log(`${item.issue}: PR now targets ${item.base}`);
-    return { verdict: 'pending' };
-  }
-  if (view.mergeable === 'CONFLICTING') return { verdict: 'fail', failed: [`merge conflict with ${item.base}`] };
-  let checks = [];
-  try {
-    checks = await gh(['pr', 'checks', item.pr, '--json', 'name,bucket'], { json: true });
-  } catch {
-    // no checks reported yet
-  }
-  const verdict = checksVerdict(checks);
-  if (verdict !== 'pass') return { verdict, failed: failedChecks(checks) };
-  await gh(['pr', 'merge', item.pr, '--squash'], { asBot: true });
-  return { verdict: 'merged' };
-}
-
-// A conflict only in union files (policies/role-guard.yaml) is the runner's to fix: it merges the base into the task's
-// copy as the bot and pushes, with no session and no fix round (factory/update-branch.mjs). Returns { merged } or
-// { pending } when GitHub has not yet seen an earlier fixing push, or { why } when the agent has to do it.
-async function updateBranch(item) {
-  const wt = taskCopyPath(item);
-  if (!fs.existsSync(wt)) return { why: 'the task has no copy on disk' };
-  git(wt, ['fetch', '-q', 'origin']);
-  if (alreadyUpdated({ cwd: wt, base: item.base, branch: item.branch })) return { pending: true };
-  if (!copyMatchesPr({ cwd: wt, branch: item.branch })) return { why: 'the copy is not the PR\'s head' };
-  const identity = await sessionIdentity();
-  const env = identity ? sessionEnv({ ...process.env }, identity) : { ...process.env };
-  const result = mergeBaseInto({
-    cwd: wt, ref: `origin/${item.base}`, attributesFile: path.join(config.repo, '.gitattributes'), env,
-    message: `${item.issue}: merge ${item.base} (by the runner: the only conflict was in union files)`,
-  });
-  if (!result.merged) return { why: result.why };
-  execFileSync('git', ['push', '-q', 'origin', `HEAD:${item.branch}`], { cwd: wt, env, stdio: ['ignore', 'pipe', 'pipe'] });
-  return { merged: true };
-}
-
-async function tryUpdateBranch(item) {
-  const up = await updateBranch(item).catch((error) => ({ why: error.message.split('\n')[0] }));
-  if (up.merged) log(`${item.issue}: merged ${item.base} into ${item.branch} itself (only union files conflicted); CI runs again`);
-  else if (!up.pending) log(`${item.issue}: cannot merge ${item.base} itself (${up.why}); the agent gets the fix round`);
-  return up;
-}
-
-// A fix round waits for the night, and by then its PR may be fixed (by Yoan, by Claude, by the runner's own merge)
-// or green after a rerun. The runner looks again before it wakes the agent, like a job that checks its precondition
-// when it starts instead of when it was queued. Returns false when the session is not needed.
-async function fixStillNeeded(task) {
-  let result;
-  try {
-    result = await advanceCi(task);
-  } catch (error) {
-    log(`${task.issue}: ci: ${error.message}`);
-    return true;
-  }
-  if (result.verdict === 'fail' && conflictOnly(result.failed)) {
-    const up = await tryUpdateBranch(task);
-    if (up.merged || up.pending) result = { verdict: 'pending' };
-  }
-  const backToCi = (extra, why) => {
-    updateItem(task.issue, {
-      stage: 'ci', ciSince: new Date().toISOString(), fixRounds: Math.max(0, (task.fixRounds ?? 1) - 1),
-      session: task.session ?? task.resumeSession, resumeSession: undefined, message: undefined, ...extra,
-    });
-    log(`${task.issue}: ${why}, so no fix session: back to waiting for CI`);
-    return false;
-  };
-  const next = fixPrecheck(result, task);
-  if (next === 'ci') return backToCi({}, `its PR no longer fails (${result.verdict})`);
-  // It still fails, maybe for another reason than when the round was queued (on 25.11 PR #20: a conflict then,
-  // other agents' evals now). The same rules as in processCi: evals alone are run once more first, and the agent
-  // gets the failures as they are now, not the old message.
-  if (next === 'rerun-evals' && (await rerunFailedJobs(task))) return backToCi({ evalReruns: 1 }, 'only the evals fail and CI runs them once more');
-  task.message = fixMessage({ pr: task.pr, failed: result.failed, branch: task.branch, base: task.base });
-  updateItem(task.issue, { message: task.message });
+// Commits everything in the copy as the bot; finishes a merge of main when one is in progress. Returns true when
+// there was something to commit. The caller checks for unresolved conflicts first.
+async function commitAll(wt, message) {
+  const env = await botEnv();
+  git(wt, ['add', '-A'], env);
+  const merging = mergeInProgress(wt);
+  if (!merging && git(wt, ['diff', '--cached', '--name-only']) === '') return false;
+  git(wt, [...NO_HOOKS, 'commit', '-q', ...(merging ? ['--no-edit'] : ['-m', message])], env);
   return true;
 }
 
-// Runs the failed jobs of the PR's last CI run again: as the bot, or as Yoan when the App may not (INV-53).
-async function rerunFailedJobs(item) {
-  try {
-    const runs = await gh(['run', 'list', '--branch', item.branch, '--event', 'pull_request', '--limit', '1', '--json', 'databaseId'], { json: true });
-    const id = runs?.[0]?.databaseId;
-    if (!id) return false;
-    try {
-      await gh(['run', 'rerun', String(id), '--failed'], { asBot: true });
-    } catch {
-      await gh(['run', 'rerun', String(id), '--failed']);
-    }
-    return true;
-  } catch (error) {
-    log(`${item.issue}: rerun: ${error.message.split('\n')[0]}`);
-    return false;
-  }
+async function push(task, wt) {
+  git(wt, [...NO_HOOKS, 'push', '-q', '-u', 'origin', `HEAD:refs/heads/${task.branch}`], await botEnv());
+  return git(wt, ['rev-parse', 'HEAD']);
 }
+
+// --- Sessions ---
+
+const CONTINUE = 'You were interrupted (the usage limit, a restart or the Mac turned off). Continue exactly where you stopped and finish the same instructions, ending with the RESULT line.';
 
 // The tasks whose session runs now: lock files of a process that is gone (a power cut) do not count.
 function activeLocks() {
@@ -317,7 +255,6 @@ function activeLocks() {
   }).map((file) => file.replace(/\.lock$/, ''));
 }
 
-// One task, one session: a second run of the same task is refused while the first one lives.
 function lock(issue) {
   const file = path.join(STATE, 'locks', `${issue}.lock`);
   const pid = Number(readJson(file, {}).pid);
@@ -333,16 +270,433 @@ function lock(issue) {
   return () => fs.rmSync(file, { force: true });
 }
 
-function latestSession(cwd) {
-  const dir = path.join(HOME, '.claude', 'projects', sessionDirName(cwd));
+function runClaude(args, cwd, logFile, role) {
+  return new Promise((resolve) => {
+    const env = { ...process.env };
+    if (config.nodeBin) env.PATH = `${config.nodeBin}:${env.PATH}`;
+    // The session works without any GitHub identity: the runner pushes and opens the PR.
+    for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN']) delete env[key];
+    // The role guard reads the role from here, for the whole session and its subagents.
+    env.INVOICELY_ROLE = role;
+    // A headless session ends with its last turn: an agent left running in the background would be lost with it.
+    env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = '1';
+    // Marks the agent's session: the runner's own CLI refuses to run inside it (see main).
+    env.INVOICELY_AGENT_SESSION = '1';
+    const child = spawn('claude', args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    const out = fs.createWriteStream(logFile, { flags: 'a' });
+    child.stdout.on('data', (chunk) => { stdout += chunk; out.write(chunk); });
+    child.stderr.on('data', (chunk) => out.write(chunk));
+    child.on('close', (code) => { out.end(); resolve({ code, stdout }); });
+  });
+}
+
+function testsLine(task) {
+  if (!task.testsCommit) return 'test-author wrote no tests for this task; its report says why.';
+  return `in commit ${task.testsCommit.slice(0, 10)}: ${(task.testFiles ?? []).join(', ') || 'see git show --stat'}`;
+}
+
+// One session of a role on the task's copy: a new one with the role's prompt, or the same session resumed with a
+// message. Returns what the session left: its status, its report and what it cost.
+async function runSession(task, role, wt, budget) {
+  const runtime = ensureRuntime();
+  const sessions = task.sessions ?? {};
+  const base = ['--agent', `invoicely-agents:${role}`, '--plugin-dir', runtime, '--settings', SANDBOX, '--permission-mode', 'acceptEdits',
+    '--output-format', 'json', '--max-budget-usd', String(budget), '--allowedTools', ...COMMON_TOOLS, ...(REPO_TOOLS[task.repo] ?? [])];
+  let args;
+  let id = sessions[role];
+  if (id) {
+    args = ['-p', task.message || CONTINUE, '--resume', id, ...base];
+  } else {
+    // The session gets its id up front and the queue remembers it, so a run cut off by a restart resumes it.
+    id = crypto.randomUUID();
+    const prompt = fillTemplate(fs.readFileSync(path.join(HERE, 'prompts', `${role}.md`), 'utf8'), {
+      ISSUE: task.issue, TASK: fs.readFileSync(task.brief, 'utf8').trim(), WT: wt, REPO: task.repo, BRANCH: task.branch, TESTS: testsLine(task),
+    });
+    args = ['-p', task.message ? `${prompt}\n\n${task.message}` : prompt, '--session-id', id, ...base];
+    updateItem(task.issue, { sessions: { ...sessions, [role]: id } });
+  }
+  // A restart while the session runs resumes it instead of repeating the instructions.
+  updateItem(task.issue, { message: CONTINUE });
+  const started = new Date();
+  const logFile = path.join(STATE, 'logs', `${task.issue}-${role}-${started.toISOString().replace(/[:.]/g, '-')}.log`);
+  log(`${task.issue}: ${role} starts in ${wt}${sessions[role] ? ' (resumed)' : ''}, cap $${budget}`);
+  const { code, stdout } = await runClaude(args, wt, logFile, role);
+  const result = parseResult(stdout);
+  const status = classify(result);
+  const ended = new Date();
+  const session = result.sessionId || id;
+  const runCost = result.costUsd == null ? null : entryCosts([...readLedger(), { session, sessionCostUsd: result.costUsd }]).at(-1);
+  ledger({
+    issue: task.issue, role, stage: task.stage, branch: task.branch, session, started: started.toISOString(), ended: ended.toISOString(),
+    minutes: minutesBetween(started, ended), status, exitCode: code, costUsd: runCost, sessionCostUsd: result.costUsd, turns: result.turns, log: logFile,
+  });
+  log(`${task.issue}: ${role} ${status}${runCost == null ? '' : ` $${runCost.toFixed(2)}`}`);
+  return { status, text: result.text, report: parseOutcome(result.text).report, session };
+}
+
+// Limit, error and question are the same for both roles. Returns true when the step ends here.
+async function settleSession(task, role, r) {
+  if (r.status === 'limit') {
+    const waits = (task.limitWaits ?? 0) + 1;
+    if (waits > MAX_LIMIT_WAITS) {
+      await askYoan(task, {
+        kind: 'error', role,
+        what: `лимитът на Max не се поднови след ${MAX_LIMIT_WAITS} изчаквания.`,
+        todo: 'виж съобщението по-долу (може да е плащане или настройка, не лимит) и пиши тук "опитай пак", когато е наред.',
+        ifNot: 'задачата стои.', details: r.text.slice(0, 1500),
+      });
+      return true;
+    }
+    const until = retryAt(r.text);
+    limitUntil = Math.max(limitUntil, until.getTime());
+    updateItem(task.issue, { waitUntil: until.toISOString(), limitWaits: waits, message: CONTINUE, sessions: { ...(task.sessions ?? {}), [role]: r.session } });
+    log(`${task.issue}: ${role} stopped by the Max limit; again at ${until.toString()}`);
+    return true;
+  }
+  updateItem(task.issue, { limitWaits: undefined, waitUntil: undefined });
+  if (r.status === 'error') {
+    await askYoan(task, {
+      kind: 'error', role,
+      what: `сесията на ${role} спря с грешка.`,
+      todo: 'прочети грешката по-долу и пиши тук "опитай пак" или какво да промени. Предложение: "опитай пак".',
+      ifNot: 'задачата стои, нищо не се променя.',
+      details: r.text.slice(0, 1500),
+    });
+    return true;
+  }
+  if (r.status === 'question') {
+    await askYoan(task, {
+      kind: 'question', role,
+      what: `отговор на въпроса на ${role}.`,
+      todo: 'прочети въпроса и предложения отговор по-долу и отговори тук.',
+      ifNot: 'задачата стои, нищо не се променя.',
+      details: r.report.slice(0, 3000),
+    });
+    return true;
+  }
+  return false;
+}
+
+// A session that wrote outside its role gets one chance to put the files back; then Yoan is asked.
+async function guardFailed(task, role, violations) {
+  if (!task.guardRetry) {
+    updateItem(task.issue, {
+      guardRetry: 1,
+      message: `The runner's check of your changes found files outside your role: ${violations.join('; ')}. Put them back as they were (git checkout or delete new files) and finish the same instructions without them, ending with the RESULT line.`,
+    });
+    log(`${task.issue}: ${role} wrote outside its role; one more try`);
+    return;
+  }
+  await askYoan(task, {
+    kind: 'question', role,
+    what: `${role} промени файлове извън ролята си и не ги върна.`,
+    todo: 'виж файловете по-долу и пиши тук какво да направи. Предложение: "върни ги и продължи".',
+    ifNot: 'задачата стои, нищо не се слива.',
+    details: violations.join('\n'),
+  });
+}
+
+// --- The steps ---
+
+// test-author: the tests of a new task, or its answer when the implementer called a test wrong.
+async function stepTests(task) {
+  const wt = ensureWorktree(task);
+  const before = git(wt, ['rev-parse', 'HEAD']);
+  const r = await runSession(task, 'test-author', wt, await budgetFor(task));
+  if (await settleSession(task, 'test-author', r)) return;
+  const violations = guardViolations(wt, before, 'test-author');
+  if (violations.length) return guardFailed(task, 'test-author', violations);
+  const dispute = task.stage === 'tests-fix';
+  // Committed here and pushed with the code: a PR never shows the implementer's work half done.
+  const changed = await commitAll(wt, dispute ? `${task.issue}: tests, after the implementer's report` : `${task.issue}: tests from the task's criteria`);
+  const next = { stage: dispute ? (task.afterDispute ?? 'code') : 'code', guardRetry: undefined, waitUntil: undefined, afterDispute: undefined };
+  if (changed) {
+    const files = gitZ(wt, ['diff', '--no-renames', '--name-only', '-z', `${before}..HEAD`]);
+    Object.assign(next, { testsCommit: git(wt, ['rev-parse', 'HEAD']), testFiles: [...new Set([...(task.testFiles ?? []), ...files])] });
+  }
+  if (!dispute) next.testReport = r.report;
+  next.message = dispute
+    ? `test-author answered your report about the tests:\n\n${r.report}\n\n${r.status === 'keep' ? 'The test stays as it is: implement to it, or end with RESULT: QUESTION if you still think the task says otherwise.' : `test-author changed the tests${changed ? ` (commit ${next.testsCommit.slice(0, 10)})` : ''}: run them again.`} Then finish the same instructions, ending with the RESULT line.`
+    : undefined;
+  updateItem(task.issue, next);
+  log(`${task.issue}: tests ${changed ? 'committed' : 'unchanged'}; next ${next.stage}`);
+}
+
+// The implementer: the code until the tests pass, or a fix round. Then the runner commits, pushes and opens the PR.
+async function stepCode(task) {
+  const wt = ensureWorktree(task);
+  const before = git(wt, ['rev-parse', 'HEAD']);
+  const r = await runSession(task, 'implementer', wt, await budgetFor(task));
+  if (await settleSession(task, 'implementer', r)) return;
+  const violations = guardViolations(wt, before, 'implementer');
+  const unresolved = unmergedFiles(wt);
+  if (unresolved.length) violations.push(`the merge of main still has conflicts in ${unresolved.join(', ')}`);
+  if (violations.length) return guardFailed(task, 'implementer', violations);
+  if (r.status === 'test_wrong') {
+    // The implementer's work so far is kept in a commit, so that test-author's diff is only its own.
+    await commitAll(wt, `${task.issue}: work in progress, before test-author's answer`);
+    const disputes = (task.disputes ?? 0) + 1;
+    const toTestAuthor = `The implementer says a test is wrong:\n\n${r.report}\n\nCheck it against the task. If the implementer is right, fix the test and end with RESULT: DONE. If the test is right, leave it and explain why for the implementer, ending with RESULT: KEEP.`;
+    if (disputes > MAX_DISPUTES) {
+      // Yoan's answer goes to test-author with the implementer's report, then back to the implementer.
+      updateItem(task.issue, { disputes: 0, stage: 'tests-fix', afterDispute: task.stage, message: toTestAuthor });
+      await askYoan(task, {
+        kind: 'dispute', role: 'test-author',
+        what: `test-author и implementer не са съгласни за тест, вече ${MAX_DISPUTES} пъти.`,
+        todo: 'прочети спора по-долу и пиши тук кой е прав и какво да направят. Предложение: прав е този, който следва "Как проверявам".',
+        ifNot: 'задачата стои, нищо не се слива.',
+        details: r.report.slice(0, 3000),
+      });
+      return;
+    }
+    updateItem(task.issue, { stage: 'tests-fix', afterDispute: task.stage, disputes, guardRetry: undefined, message: toTestAuthor });
+    log(`${task.issue}: the implementer calls a test wrong; back to test-author (${disputes}/${MAX_DISPUTES})`);
+    return;
+  }
+  const round = task.round ?? 0;
+  await commitAll(wt, task.stage === 'fix' ? `${task.issue}: fix round ${round}` : `${task.issue}: ${task.title}`);
+  if (git(wt, ['rev-list', '--count', 'origin/main..HEAD']) === '0') {
+    await askYoan(task, {
+      kind: 'question', role: 'implementer', what: 'implementer свърши без нито една промяна, така че няма PR.',
+      todo: 'прочети отчета по-долу и пиши тук какво да направи. Предложение: уточни "Какво" в задачата.', ifNot: 'задачата стои.',
+      details: r.report.slice(0, 3000),
+    });
+    return;
+  }
+  updateItem(task.issue, { stage: 'publish', message: undefined, guardRetry: undefined, ...(task.stage === 'code' ? { report: r.report } : {}) });
+  await publish(readQueue().find((t) => t.issue === task.issue));
+}
+
+// Push and PR, apart from the session: when GitHub fails here, the runner tries again without a new session.
+async function publish(task) {
+  const wt = ensureWorktree(task);
+  const sha = await push(task, wt);
+  const pr = task.pr ?? (await existingPr(task)) ?? (await openPr(task, task.report));
+  updateItem(task.issue, {
+    stage: 'review', pr, pushedSha: sha, reviewSince: new Date().toISOString(), reviewReruns: undefined, rerunAt: undefined,
+    // No new commit since the last review (the implementer changed nothing after an answer or a finding): the review
+    // job runs again on the same head, with Yoan's answer in the PR description.
+    needsReviewRerun: task.pr && sha === task.pushedSha ? true : undefined,
+  });
+  log(`${task.issue}: pushed ${sha.slice(0, 10)}; the reviewer reads ${pr}`);
+}
+
+async function existingPr(task) {
+  const slug = repoSlug(repoDir(task));
+  const open = await gh(['pr', 'list', '--repo', slug, '--head', task.branch, '--state', 'open', '--json', 'url'], { json: true, cwd: repoDir(task) });
+  return open[0]?.url ?? null;
+}
+
+// The PR's description is the task itself (the reviewer's brief) and the implementer's summary.
+async function openPr(task, report) {
+  const file = path.join(os.tmpdir(), `invoicely-pr-${task.issue}.md`);
+  const body = [
+    '## Задачата', '', fs.readFileSync(task.brief, 'utf8').trim(), '',
+    '## Какво е направено', '', report || '(няма резюме)', '',
+    `## Тестове (test-author)`, '', testsLine(task), '',
+    `Linear: ${task.issue}`,
+  ].join('\n');
+  fs.writeFileSync(file, body);
   try {
-    const files = fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl'))
-      .map((f) => ({ f, t: fs.statSync(path.join(dir, f)).mtimeMs })).sort((a, b) => b.t - a.t);
-    return files.length ? files[0].f.replace(/\.jsonl$/, '') : null;
-  } catch {
-    return null;
+    const slug = repoSlug(repoDir(task));
+    const out = await gh(['pr', 'create', '--repo', slug, '--base', 'main', '--head', task.branch, '--title', `${task.issue}: ${task.title}`, '--body-file', file], { asBot: true, cwd: repoDir(task) });
+    const url = /https:\/\/github\.com\/\S+\/pull\/\d+/.exec(out)?.[0];
+    if (!url) throw new Error(`gh pr create gave no PR URL: ${out.slice(0, 200)}`);
+    return url;
+  } finally {
+    fs.rmSync(file, { force: true });
   }
 }
+
+// --- The review, CI and the merge ---
+
+async function rerunReview(task, check) {
+  const job = /\/job\/(\d+)/.exec(check?.link ?? '')?.[1];
+  if (!job) return false;
+  const slug = repoSlug(repoDir(task));
+  try {
+    await gh(['api', '-X', 'POST', `repos/${slug}/actions/jobs/${job}/rerun`], { asBot: true });
+  } catch {
+    // The App may not rerun jobs (actions: read): Yoan's gh does it.
+    await gh(['api', '-X', 'POST', `repos/${slug}/actions/jobs/${job}/rerun`]);
+  }
+  return true;
+}
+
+async function fixRound(task, { review = null, failed = [], conflict = null }) {
+  const round = (task.round ?? 0) + 1;
+  if (round > MAX_ROUNDS) {
+    await askYoan(task, {
+      kind: 'rounds', role: 'implementer',
+      what: `ревюто или CI на ${task.pr} не минават след ${MAX_ROUNDS} кръга поправки.`,
+      todo: 'прочети последните забележки по-долу и пиши тук как да продължи implementer. Предложение: кажи коя забележка е по-важна или "поемам", ако го поемаш ти.',
+      ifNot: 'PR-ът остава отворен и не се слива.',
+      details: [review, failed.length ? `Червени проверки: ${failed.join(', ')}` : '', conflict ? `Конфликт с main в: ${conflict.join(', ')}` : ''].filter(Boolean).join('\n\n').slice(0, 3000),
+    });
+    return;
+  }
+  updateItem(task.issue, { stage: 'fix', round, message: fixMessage({ round, maxRounds: MAX_ROUNDS, review, failed, conflict }), reviewReruns: undefined, waitUntil: undefined, limitWaits: undefined });
+  log(`${task.issue}: fix round ${round}${review ? ' (review)' : ''}${failed.length ? ` (${failed.join(', ')})` : ''}${conflict ? ' (conflict with main)' : ''}`);
+}
+
+// main moved on and the PR conflicts with it: the runner merges main into the copy. A clean merge is pushed; otherwise
+// the merge stays open with git's conflict markers and the implementer resolves them in a fix round.
+async function mergeMain(task) {
+  const wt = ensureWorktree(task);
+  const env = await botEnv();
+  git(wt, ['fetch', '-q', 'origin'], env);
+  try {
+    git(wt, [...NO_HOOKS, 'merge', '-q', '--no-edit', 'origin/main'], env);
+  } catch {
+    const conflicts = unmergedFiles(wt);
+    if (conflicts.length) return { conflicts };
+    throw new Error('git merge origin/main failed without conflicts');
+  }
+  const sha = await push(task, wt);
+  updateItem(task.issue, { pushedSha: sha, reviewSince: new Date().toISOString() });
+  return { merged: true };
+}
+
+function recordReview(task, review) {
+  if (readLedger().some((e) => e.status === 'review' && e.reviewId === review.id)) return;
+  ledger({
+    issue: task.issue, status: 'review', reviewId: review.id, round: task.round ?? 0, verdict: review.marker.verdict,
+    sha: review.marker.sha, costUsd: review.marker.costUsd, pr: task.pr, findings: findingLines(reviewText(review.body)).slice(0, 10),
+  });
+}
+
+// One look at every PR that waits for its review. Needs no session, so it runs between sessions. A PR on which GitHub
+// or git keeps failing is not left to wait forever: after a few rounds Yoan is told.
+async function processReviews() {
+  for (const task of readQueue().filter((t) => t.stage === 'review')) {
+    try {
+      await processReview(task);
+      if (task.reviewErrors) updateItem(task.issue, { reviewErrors: undefined });
+    } catch (error) {
+      const errors = (task.reviewErrors ?? 0) + 1;
+      log(`${task.issue}: review step failed (${errors}/${MAX_REVIEW_ERRORS}): ${error.message.split('\n')[0]}`);
+      if (errors < MAX_REVIEW_ERRORS) {
+        updateItem(task.issue, { reviewErrors: errors });
+        continue;
+      }
+      updateItem(task.issue, { reviewErrors: undefined });
+      await askYoan(task, {
+        kind: 'review_stuck', role: 'reviewer', what: `runner-ът не може да продължи с ${task.pr}: GitHub или git отказват ${MAX_REVIEW_ERRORS} пъти подред.`,
+        todo: 'виж грешката по-долу и пиши тук "опитай пак", когато е наред. Предложение: "опитай пак".', ifNot: 'PR-ът стои и не се слива.',
+        details: error.message.slice(0, 1500),
+      });
+    }
+  }
+}
+
+async function processReview(task) {
+  const cwd = repoDir(task);
+  const slug = repoSlug(cwd);
+  const view = await gh(['pr', 'view', task.pr, '--json', 'number,state,headRefOid,mergeable'], { json: true, cwd });
+  let checks = null;
+  try {
+    checks = await gh(['pr', 'checks', task.pr, '--json', 'name,bucket,link'], { json: true, cwd });
+  } catch {
+    // no checks reported yet, or GitHub did not answer: the decision waits
+  }
+  const reviews = await gh(['api', `repos/${slug}/pulls/${view.number}/reviews?per_page=100`], { json: true, cwd });
+  const d = reviewDecision({ task, view, checks, reviews, limitUntil, timeoutMinutes: REVIEW_TIMEOUT_MINUTES, maxLimitWaits: MAX_LIMIT_WAITS });
+  if (d.reviewEntry) recordReview(task, d.reviewEntry);
+  const reviewCheck = checks?.find((c) => isReviewCheck(c.name));
+  switch (d.action) {
+    case 'wait':
+      return undefined;
+    case 'finish':
+      return finish(task);
+    case 'closed':
+      ledger({ issue: task.issue, status: 'closed', pr: task.pr });
+      updateItem(task.issue, null);
+      await comment(task.issue, `**Спряно.** PR-ът ${task.pr} е затворен, затова runner-ът извади задачата от опашката. Върни я в Ready, за да започне отначало на нов клон.`);
+      return undefined;
+    case 'merge-main': {
+      const merged = await mergeMain(task);
+      if (merged.merged) log(`${task.issue}: merged main into the PR itself; the reviewer looks again`);
+      else await fixRound(task, { conflict: merged.conflicts });
+      return undefined;
+    }
+    case 'rerun':
+      if (!(await rerunReview(task, reviewCheck))) {
+        return askYoan(task, {
+          kind: 'review_stuck', role: 'reviewer', what: `ревюто на ${task.pr} трябва да се пусне пак, а runner-ът не намира job-а.`,
+          todo: 'пусни job-а review пак в PR-а или пиши тук "опитай пак". Предложение: "опитай пак".', ifNot: 'PR-ът стои и не се слива.',
+        });
+      }
+      updateItem(task.issue, { ...d.set, rerunAt: new Date().toISOString(), reviewSince: new Date().toISOString() });
+      log(`${task.issue}: the review job runs again`);
+      return undefined;
+    case 'limit-wait':
+      updateItem(task.issue, { waitUntil: d.until, limitWaits: (task.limitWaits ?? 0) + 1 });
+      log(`${task.issue}: the review waits for the Max limit; again at ${d.until}`);
+      return undefined;
+    case 'question':
+      return askYoan(task, {
+        kind: 'review_question', role: 'reviewer', what: `отговор на въпроса на reviewer-а за ${task.pr}.`,
+        todo: 'прочети въпроса и предложения отговор по-долу и отговори тук.', ifNot: 'PR-ът стои и не се слива.', details: d.text.slice(0, 3000),
+      });
+    case 'fix':
+      return fixRound(task, { review: d.review ?? null, failed: d.failed ?? [] });
+    case 'merge':
+      // Only the head the reviewer passed: a push after the review would make GitHub refuse the merge.
+      await gh(['pr', 'merge', task.pr, '--squash', '--match-head-commit', d.sha], { asBot: true, cwd });
+      log(`${task.issue}: merged ${task.pr}`);
+      return finish(task);
+    default:
+      return askYoan(task, {
+        kind: 'review_stuck', role: 'reviewer', what: `${task.pr}: ${d.why}.`,
+        todo: 'виж PR-а и пиши тук "опитай пак", когато е наред. Предложение: "опитай пак".', ifNot: 'PR-ът стои и не се слива.',
+      });
+  }
+}
+
+// After the merge: the summary in the task, Done or "Чака Йоан" for the UI check, and the copy goes.
+async function finish(task) {
+  ledger({ issue: task.issue, status: 'merged', pr: task.pr, branch: task.branch });
+  updateItem(task.issue, null);
+  const entries = readLedger();
+  const reviews = entries.filter((e) => e.issue === task.issue && e.status === 'review' && (!task.since || Date.parse(e.ended) >= Date.parse(task.since)));
+  const summary = summaryBody({
+    pr: task.pr, report: task.report, reviews, cost: taskCost(entries, task.issue, task.since),
+    minutes: task.since ? minutesBetween(new Date(task.since), new Date()) : null,
+  });
+  const want = task.ui ? 'Чака Йоан' : 'Done';
+  if (task.ui) {
+    const who = await yoanMention();
+    await comment(task.issue, `${summary}\n\n---\n\n${who ? `${who} ` : ''}**Чака:** твоята проверка на UI.\n\n**Какво да направиш:** мини стъпките от "Как проверявам" и премести задачата в Done. Ако нещо не е наред, опиши го в нова задача.\n\n**Ако не отговориш:** кодът е в main, задачата остава тук.`);
+    ledger({ issue: task.issue, status: 'needs_answer', kind: 'ui_check' });
+  } else {
+    await comment(task.issue, summary);
+  }
+  // Linear's own GitHub rules may move the task when they see the merge, within seconds: the runner's status comes after.
+  await sleep(30 * 1000);
+  await setState(task.issue, want);
+  await cleanup({ repo: repoDir(task), only: task.branch });
+}
+
+// --- Money ---
+
+async function budgetFor(task) {
+  const cap = task.budgetUsd ?? config.budgetUsd;
+  const spent = taskCost(readLedger(), task.issue, task.since).sessions;
+  const left = Math.floor((cap - spent) * 100) / 100;
+  if (left >= 1) return left;
+  await askYoan(task, {
+    kind: 'over_budget', role: null,
+    what: `задачата стигна тавана си: сесиите ѝ са похарчили $${spent.toFixed(2)} от $${cap} (цена по API; на Max е дял от лимита).`,
+    todo: `пиши тук "продължи", за да получи още $${config.budgetUsd}, или "спри". Предложение: "продължи", ако PR-ът е близо до готов.`,
+    ifNot: 'задачата стои и не харчи нищо.',
+  });
+  throw new OverBudget();
+}
+
+class OverBudget extends Error {}
+
+// --- Linear ---
 
 function loadEnv() {
   const env = {};
@@ -357,8 +711,7 @@ function loadEnv() {
   return env;
 }
 
-// Linear: a comment on the task after every run; a question also moves it to "Чака Йоан" and mentions Yoan.
-// As the "Invoicely Agents" app when its client credentials are in .env (INV-30), otherwise as Yoan.
+// As the "Invoicely Agents" app when its client credentials are in .env (INV-30), so Yoan gets the notifications.
 async function linear(query, variables, options) {
   const client = linearClient({ env: loadEnv(), cacheFile: path.join(STATE, 'cache', 'linear-app-token.json') });
   if (!client) return null;
@@ -377,520 +730,173 @@ async function yoanMention() {
   return mention(yoanUser);
 }
 
-async function reportToLinear(entry, resultText) {
-  try {
-    const issue = (await linear('query($id:String!){issue(id:$id){id team{id}}}', { id: entry.issue }))?.issue;
-    if (!issue) return;
-    const cost = entry.costUsd == null ? '' : `, около $${entry.costUsd.toFixed(2)}`;
-    const head = `Агентът работи ${entry.minutes} мин.${cost}.`;
-    const who = await yoanMention();
-    const ask = (what, todo, ifNot, details = '') => `${who ? `${who} ` : ''}**Чака:** ${what}\n\n**Какво да направиш:** ${todo}\n\n**Ако не отговориш:** ${ifNot}${details ? `\n\n---\n\n${details}` : ''}`;
-    let body;
-    let waitForYoan = false;
-    if (entry.status === 'done' && isFeatureBranch(entry.base)) return; // reported when it is merged
-    if (entry.status === 'done') body = `**Готово.** ${head} PR: ${entry.pr}`;
-    else if (entry.status === 'merged') body = `**Слято в \`${entry.base}\`.** CI е зелен. PR: ${entry.pr}`;
-    else if (entry.status === 'ci_failed') {
-      waitForYoan = true;
-      body = ask(`CI на ${entry.pr} остава червен след ${entry.fixRounds} поправки (${(entry.failed ?? []).join(', ') || 'проверка'}).`,
-        'виж проверките в PR-а и пиши тук "опитай пак" или "поемам". Предложение: "опитай пак", ако грешката е от лимита на Max.',
-        `PR-ът не се слива в \`${entry.base}\`, а задачите, които зависят от тази, не тръгват.`);
-    } else if (entry.status === 'blocked') {
-      waitForYoan = true;
-      body = ask(`задачата зависи от ${entry.blockedBy.join(', ')}, която не е слята в \`${entry.base}\` и не е в опашката.`,
-        'добави зависимостта в опашката или махни зависимостта. Предложение: добави я.', 'задачата не тръгва.');
-    } else if (entry.status === 'over_budget') {
-      waitForYoan = true;
-      body = ask(`задачата стигна тавана си: сесиите ѝ са похарчили $${entry.spentUsd.toFixed(2)} от $${entry.capUsd} (цена по API; на Max е дял от лимита).`,
-        `пиши тук "продължи", за да получи още $${config.budgetUsd}, или "спри". Предложение: "продължи", ако PR-ът е близо до готов.`,
-        'задачата стои извън опашката и не харчи нищо.');
-    } else if (entry.status === 'limit') body = `**Спрян от лимита на Max.** ${head} Подновява се сам в ${entry.resetAt}.`;
-    else if (entry.status === 'error') body = `**Грешка.** ${head}\n\n${resultText.slice(0, 1500)}`;
-    else {
-      waitForYoan = true;
-      body = ask('отговор на въпроса на агента.', 'прочети въпроса и предложения отговор по-долу и отговори тук.', 'задачата стои, нищо не се променя.', resultText.slice(0, 3000));
-    }
-    if (waitForYoan) {
-      const states = await linear('query($team:String!){team(id:$team){states{nodes{id name}}}}', { team: issue.team.id });
-      const waiting = states?.team?.states?.nodes?.find((s) => s.name === 'Чака Йоан');
-      if (waiting) await linear('mutation($id:String!,$state:String!){issueUpdate(id:$id,input:{stateId:$state}){success}}', { id: issue.id, state: waiting.id });
-    }
-    await linear('mutation($id:String!,$body:String!){commentCreate(input:{issueId:$id,body:$body}){success}}', { id: issue.id, body });
-  } catch (error) {
-    log(`linear: ${error.message}`);
-  }
-}
-
-// Agent sessions act as the GitHub App bot when it is set up: Yoan gets the notifications and approves its PRs,
-// and the bot cannot change workflows or the protection of main. Without the App they act as Yoan, as before.
-// The bot identity. The runner's own pushes use the App key directly. An agent session (issue set) runs in the
-// sandbox, which does not let it read ~/.invoicely (INV-57): only the one-hour token leaves it, into the session's own
-// folder, where gh and the git helper read it and the sandbox lets nothing write; the folder goes when the session ends.
-// Like GITHUB_TOKEN in GitHub Actions: the job's code may use its token, never the App's key.
-async function sessionIdentity(issue = null) {
-  const app = appSettings(STATE);
-  if (!app) return null;
-  const script = path.join(HERE, 'github-app.mjs');
-  const dir = issue ? path.join(SESSIONS, issue) : null;
-  const ghConfigDir = dir ? path.join(dir, 'gh') : path.join(STATE, 'gh-bot');
-  const tokenFile = dir ? path.join(dir, 'git-token') : null;
-  const write = async () => {
-    const token = await installationToken(app);
-    writeGhConfig(ghConfigDir, token, app.slug);
-    if (tokenFile) writeTokenFile(tokenFile, token);
-  };
-  await write(); // fails here, before the session, when the key or the installation is wrong
-  return {
-    name: `${app.slug}[bot]`, slug: app.slug, botUserId: app.botUserId, ghConfigDir, refresh: write,
-    cleanup: () => { if (dir) fs.rmSync(dir, { recursive: true, force: true }); },
-    helperCommand: `!'${process.execPath}' '${script}' git-credential${tokenFile ? ` --token-file '${tokenFile}'` : ''}`,
-  };
-}
-
-function runClaude(args, cwd, logFile, identity) {
-  return new Promise((resolve) => {
-    let env = { ...process.env };
-    if (config.nodeBin) env.PATH = `${config.nodeBin}:${env.PATH}`;
-    if (identity) env = sessionEnv(env, identity);
-    // A headless session ends with its last turn: an agent left running in the background would be lost with it.
-    env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = '1';
-    // Marks the agent's session: the runner's own CLI refuses to run inside it (see main).
-    env.INVOICELY_AGENT_SESSION = '1';
-    const child = spawn('claude', args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '';
-    const out = fs.createWriteStream(logFile, { flags: 'a' });
-    // The bot token lives one hour; gh reads it from the file, so the file is renewed while the session runs.
-    const timer = identity ? setInterval(() => identity.refresh().catch((error) => log(`github: ${error.message}`)), 5 * 60 * 1000) : null;
-    child.stdout.on('data', (chunk) => { stdout += chunk; out.write(chunk); });
-    child.stderr.on('data', (chunk) => out.write(chunk));
-    child.on('close', (code) => { if (timer) clearInterval(timer); out.end(); resolve({ code, stdout }); });
-  });
-}
-
-async function runTask(task, budgetCap) {
-  const unlock = lock(task.issue);
-  try {
-    const runtime = ensureRuntime();
-    const prBase = task.base || 'main';
-    ensureBase(prBase);
-    const wt = ensureWorktree(task, prBase);
-    if (task.worktree !== wt) updateItem(task.issue, { worktree: wt });
-    const budget = Math.min(task.budgetUsd ?? config.budgetUsd, budgetCap ?? Infinity);
-    const base = ['--plugin-dir', runtime, '--settings', SANDBOX, '--permission-mode', 'acceptEdits', '--output-format', 'json',
-      '--max-budget-usd', String(budget), ...(task.addDir ? ['--add-dir', task.addDir] : []), '--allowedTools', ...ALLOWED_TOOLS];
-    let args;
-    let newSession = null;
-    if (task.resumeSession) {
-      const message = task.message || 'You stopped before finishing (usage limit or interruption). Continue exactly where you stopped and finish the same instructions.';
-      args = ['-p', `${message}\n\n${FOREGROUND}`, '--resume', task.resumeSession, ...base];
-    } else {
-      // The session gets its id up front and the queue remembers it, so a run cut off by a restart or by the Mac
-      // turning off resumes the same session instead of starting over. Commits and PRs name it (INV-49).
-      newSession = crypto.randomUUID();
-      const template = fs.readFileSync(path.join(HERE, 'prompts', 'prompt-engineer-task.md'), 'utf8');
-      const prompt = fillTemplate(template, {
-        ISSUE: task.issue, BRANCH: task.branch, BRIEF: task.brief, WT: wt, BASE: prBase, SESSION: newSession,
-        ANSWERS_LINE: task.answers ? ` Add the answers in ${task.answers} to the questions it asked earlier.` : '',
-      });
-      args = ['-p', prompt, '--session-id', newSession, ...base];
-    }
-    const started = new Date();
-    const logFile = path.join(STATE, 'logs', `${task.issue}-${started.toISOString().replace(/[:.]/g, '-')}.log`);
-    log(`${task.issue}: start in ${wt}${task.resumeSession ? ` (resume ${task.resumeSession})` : ''}, cap $${budget}`);
-    const identity = await sessionIdentity(task.issue);
-    log(`${task.issue}: github as ${identity ? identity.name : 'Yoan (no GitHub App in config.json)'}`);
-    if (newSession) updateItem(task.issue, { resumeSession: newSession, message: INTERRUPTED, startFailures: undefined });
-    let ran;
-    try {
-      ran = await runClaude(args, wt, logFile, identity);
-    } finally {
-      identity?.cleanup();
-    }
-    const { code, stdout } = ran;
-    const result = parseResult(stdout);
-    const status = classify(result);
-    const ended = new Date();
-    const reset = parseLimitReset(result.text, ended);
-    const session = result.sessionId || latestSession(wt);
-    // result.costUsd is the session's running total; the entry keeps it and what this run itself cost (INV-47).
-    const runCost = result.costUsd == null ? null : entryCosts([...readLedger(), { session, sessionCostUsd: result.costUsd }]).at(-1);
-    const entry = {
-      issue: task.issue, branch: task.branch, base: prBase, session, started: started.toISOString(),
-      ended: ended.toISOString(), minutes: minutesBetween(started, ended), status, exitCode: code, costUsd: runCost, sessionCostUsd: result.costUsd,
-      turns: result.turns, pr: findPrUrl(result.text), resetAt: reset ? reset.toString() : null, resumedFrom: task.resumeSession ?? null, actor: identity ? identity.name : 'yoan', log: logFile, worktree: wt,
-    };
-    fs.appendFileSync(LEDGER, `${JSON.stringify(entry)}\n`);
-    log(`${task.issue}: ${status}${entry.pr ? ` ${entry.pr}` : ''}`);
-    await reportToLinear(entry, result.text);
-    return { ...entry, reset };
-  } finally {
-    unlock();
-  }
-}
-
-function parseTask(argv) {
-  const [issue, ...rest] = argv;
-  if (!/^INV-\d+$/.test(issue ?? '')) throw new Error('first argument must be a task id such as INV-31');
-  const task = { issue };
-  for (let i = 0; i < rest.length; i += 2) {
-    const key = {
-      '--branch': 'branch', '--brief': 'brief', '--answers': 'answers', '--budget': 'budgetUsd', '--resume-session': 'resumeSession',
-      '--message': 'message', '--add-dir': 'addDir', '--base': 'base', '--depends-on': 'dependsOn',
-    }[rest[i]];
-    if (!key) throw new Error(`unknown option ${rest[i]}`);
-    if (key === 'budgetUsd') task[key] = Number(rest[i + 1]);
-    else if (key === 'dependsOn') task[key] = rest[i + 1].split(',').map((s) => s.trim()).filter(Boolean);
-    else task[key] = rest[i + 1];
-  }
-  if (task.base && task.base !== 'main' && !isFeatureBranch(task.base)) throw new Error('--base must be main or feature/<name>');
-  if (!task.branch) throw new Error('--branch is required');
-  if (!task.brief && !task.resumeSession) throw new Error('--brief is required for a new run');
-  return task;
-}
-
-const FOREGROUND = 'Run every agent in the foreground (run_in_background: false) and wait for its result: this session ends with your turn, so an agent left in the background is lost.';
-const INTERRUPTED = `You were interrupted: the runner restarted or the Mac was turned off. Continue exactly where you stopped and finish the same instructions. ${FOREGROUND}`;
-const MAX_FIX_ROUNDS = 2;
-const CI_TIMEOUT_MINUTES = 150;
-
-function ledger(entry) {
-  fs.appendFileSync(LEDGER, `${JSON.stringify(entry)}\n`);
-}
-
-function readLedger() {
-  if (!fs.existsSync(LEDGER)) return [];
-  return fs.readFileSync(LEDGER, 'utf8').split('\n').filter(Boolean).flatMap((line) => {
-    try {
-      return [JSON.parse(line)];
-    } catch {
-      return [];
-    }
-  });
-}
-
-// The evals CI ran on a PR spend the same Max limit, so their cost goes into the ledger as well (once per CI run).
-async function recordCiEvals(item) {
-  try {
-    const runs = await gh(['run', 'list', '--branch', item.branch, '--event', 'pull_request', '--status', 'completed', '--limit', '1', '--json', 'databaseId'], { json: true });
-    const runId = runs[0]?.databaseId;
-    if (!runId || readLedger().some((e) => e.status === 'ci-evals' && e.runId === runId)) return;
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ci-evals-'));
-    try {
-      await gh(['run', 'download', String(runId), '-n', 'eval-results', '-D', dir]);
-    } catch {
-      return; // no evals in this run: no agent changed
-    } finally {
-      setTimeout(() => fs.rmSync(dir, { recursive: true, force: true }), 60 * 1000).unref();
-    }
-    const script = path.join(ensureRuntime(), 'scripts', 'eval-cost.mjs');
-    const cost = JSON.parse(execFileSync(process.execPath, [script, dir, '--json']).toString());
-    ledger({ issue: item.issue, branch: item.branch, base: item.base, pr: item.pr, runId, ended: new Date().toISOString(), status: 'ci-evals', costUsd: cost.totalUsd, cases: cost.cases.length });
-    log(`${item.issue}: CI evals cost $${cost.totalUsd} (run ${runId})`);
-  } catch (error) {
-    log(`${item.issue}: CI evals cost unknown: ${error.message}`);
-  }
-}
-
-// One report per night, as an update of the Linear project, when the night is over or the queue is empty.
-async function reportNight(reason) {
-  const since = nightStart(new Date(), config.windowStart);
-  const stateFile = path.join(STATE, 'reports.json');
-  const state = readJson(stateFile, { nights: [] });
-  if (state.nights.includes(since.toISOString())) return;
-  const entries = readLedger();
-  if (!entries.some((e) => e.ended && Date.parse(e.ended) >= since.getTime())) return;
-  const cleaned = readJson(path.join(STATE, 'cleanup.json'), {}).summary;
-  const fresh = cleaned && cleaned.day === new Date().toLocaleDateString('sv-SE') ? `\n\n${cleaned.text}` : '';
-  const body = `${nightReport(entries, since, config.nightBudgetUsd)}\n\n${reason}${fresh}`;
-  // A report that did not reach Linear (no network after the Mac wakes) is tried again on the next round, up to
-  // 12 times (about an hour); before INV-47 it was marked as sent and never reached Linear.
-  const key = since.toISOString();
-  const tries = (state.tries?.[key] ?? 0) + 1;
-  let sent = false;
-  try {
-    const ok = await linear('mutation($p:String!,$b:String!){projectUpdateCreate(input:{projectId:$p,body:$b}){success}}', { p: config.reportProjectId, b: body });
-    if (ok === null) log('night report: no Linear key, report only in the log');
-    sent = true;
-  } catch (error) {
-    log(`night report (try ${tries} of 12): ${error.message}`);
-  }
-  if (tries === 1) log(`night report\n${body}`);
-  if (sent || tries >= 12) {
-    state.nights = [...state.nights.slice(-30), key];
-    if (state.tries) delete state.tries[key];
-  } else {
-    state.tries = { ...(state.tries ?? {}), [key]: tries };
-  }
-  fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
-}
-
-// Change one queue item by its task id; null removes it. The queue file is re-read, so edits made meanwhile stay.
-function updateItem(issue, change) {
-  const queue = readJson(QUEUE, []);
-  const at = queue.findIndex((t) => t.issue === issue);
-  if (at === -1) return;
-  if (change === null) queue.splice(at, 1);
-  else {
-    queue[at] = { ...queue[at], ...change };
-    for (const key of Object.keys(queue[at])) if (queue[at][key] === undefined) delete queue[at][key];
-  }
-  fs.writeFileSync(QUEUE, JSON.stringify(queue, null, 2));
-}
-
-// PRs waiting for CI are checked at any hour: merging into a feature branch needs no session.
-async function processCi() {
-  for (const item of readJson(QUEUE, []).filter((t) => t.stage === 'ci')) {
-    let result;
-    try {
-      result = await advanceCi(item);
-    } catch (error) {
-      log(`${item.issue}: ci: ${error.message}`);
-      continue;
-    }
-    const done = { issue: item.issue, branch: item.branch, base: item.base, pr: item.pr, ended: new Date().toISOString() };
-    if (result.verdict === 'pending') {
-      if (minutesBetween(new Date(item.ciSince), new Date()) < CI_TIMEOUT_MINUTES) continue;
-      result = { verdict: 'timeout', failed: [`CI did not finish in ${CI_TIMEOUT_MINUTES} minutes`] };
-    }
-    await recordCiEvals(item);
-    if (result.verdict === 'merged' || result.verdict === 'closed') {
-      const entry = { ...done, status: result.verdict };
-      ledger(entry);
-      updateItem(item.issue, null);
-      log(`${item.issue}: ${entry.status} ${item.pr}`);
-      if (entry.status === 'merged') {
-        // The runner is the one writer of its tasks' statuses (INV-50, INV-61): Done when merged, also into a feature
-        // branch, so that Linear's own GitHub rules can be off for feature/ and stop closing the feature (INV-10, 25.11).
-        await setState(item.issue, 'Done');
-        await reportToLinear(entry, '');
-      }
-      await cleanup({ only: item.branch }); // the task's copy and branch go with it (INV-48)
-      continue;
-    }
-    if (result.verdict === 'fail' && conflictOnly(result.failed)) {
-      const up = await tryUpdateBranch(item);
-      if (up.merged) updateItem(item.issue, { ciSince: new Date().toISOString() });
-      if (up.merged || up.pending) continue;
-    }
-    if (result.verdict === 'fail' && shouldRerunEvals(result.failed, item) && (await rerunFailedJobs(item))) {
-      updateItem(item.issue, { evalReruns: 1, ciSince: new Date().toISOString() });
-      log(`${item.issue}: only the evals failed; CI runs them once more before a fix round`);
-      continue;
-    }
-    const rounds = item.fixRounds ?? 0;
-    if (result.verdict === 'fail' && rounds < MAX_FIX_ROUNDS) {
-      log(`${item.issue}: CI failed (${result.failed.join(', ')}), fix round ${rounds + 1}`);
-      updateItem(item.issue, {
-        stage: 'run', resumeSession: item.session, fixRounds: rounds + 1,
-        message: fixMessage({ pr: item.pr, failed: result.failed, branch: item.branch, base: item.base }),
-      });
-      continue;
-    }
-    const entry = { ...done, status: 'ci_failed', fixRounds: rounds, failed: result.failed, session: item.session };
-    ledger(entry);
-    updateItem(item.issue, null);
-    log(`${item.issue}: ci_failed ${item.pr}`);
-    await reportToLinear(entry, '');
-  }
-}
-
-async function mergedByBase(queue) {
-  const map = new Map();
-  for (const base of new Set(queue.map((t) => t.base || 'main'))) map.set(base, await mergedInto(base));
-  return map;
-}
-
-// A task whose dependency is neither merged nor in the queue would wait forever: it is taken out and Yoan is asked.
-// A dependency that waits for Yoan's answer (a question, a red CI) is not gone: its answer puts it back in the queue.
-async function dropBlocked(queue, merged) {
-  const last = new Map();
-  for (const e of readLedger()) if (['needs_answer', 'ci_failed', 'over_budget', 'answered', 'merged', 'error', 'blocked', 'closed'].includes(e.status)) last.set(e.issue, e.status);
-  const waitingForYoan = (id) => ['needs_answer', 'ci_failed', 'over_budget'].includes(last.get(id));
-  for (const task of queue) {
-    if (task.stage === 'ci') continue;
-    const missing = blockingDeps(task, merged.get(task.base || 'main') ?? new Set()).filter((dep) => !queue.some((q) => q.issue === dep) && !waitingForYoan(dep));
-    if (missing.length === 0) continue;
-    const entry = { issue: task.issue, branch: task.branch, base: task.base || 'main', ended: new Date().toISOString(), status: 'blocked', blockedBy: missing };
-    ledger(entry);
-    updateItem(task.issue, null);
-    log(`${task.issue}: blocked by ${missing.join(', ')}`);
-    await reportToLinear(entry, '');
-  }
-}
-
-// --- Linear as the "go" button (INV-45) ---
-
-const ISSUE_FIELDS = 'id identifier title description branchName state{name type} team{id} parent{identifier} inverseRelations{nodes{type issue{identifier state{type}}}}';
-
 async function setState(issueKey, stateName) {
   const issue = (await linear('query($id:String!){issue(id:$id){id team{states{nodes{id name}}}}}', { id: issueKey }))?.issue;
   const state = issue?.team?.states?.nodes?.find((s) => s.name === stateName);
   if (state) await linear('mutation($id:String!,$s:String!){issueUpdate(id:$id,input:{stateId:$s}){success}}', { id: issue.id, s: state.id });
 }
 
-async function askYoan(issueKey, what, todo, ifNot) {
+async function comment(issueKey, body) {
+  try {
+    const issue = (await linear('query($id:String!){issue(id:$id){id}}', { id: issueKey }))?.issue;
+    if (issue) await linear('mutation($id:String!,$b:String!){commentCreate(input:{issueId:$id,body:$b}){success}}', { id: issue.id, b: body });
+  } catch (error) {
+    log(`linear: ${error.message.slice(0, 300)}`);
+  }
+}
+
+// A question in three parts that mentions Yoan (a notification on his phone) and moves the task to "Чака Йоан".
+// The task leaves the queue; the ledger keeps it as it was, so his answer puts it back where it stopped.
+async function askYoan(task, { kind, role, what, todo, ifNot, details = '' }) {
+  // The queue item is fresher than the copy a step holds (session ids are written there as they start).
+  const snapshot = { ...task, ...readQueue().find((t) => t.issue === task.issue) };
+  delete snapshot.waitUntil;
+  ledger({ issue: task.issue, status: 'needs_answer', kind, role, pr: task.pr ?? null, task: snapshot });
+  updateItem(task.issue, null);
+  log(`${task.issue}: waits for Yoan (${kind})`);
   const who = await yoanMention();
-  const body = `${who ? `${who} ` : ''}**Чака:** ${what}\n\n**Какво да направиш:** ${todo}\n\n**Ако не отговориш:** ${ifNot}`;
-  const issue = (await linear('query($id:String!){issue(id:$id){id}}', { id: issueKey }))?.issue;
-  if (!issue) return;
-  await setState(issueKey, 'Чака Йоан');
-  await linear('mutation($id:String!,$b:String!){commentCreate(input:{issueId:$id,body:$b}){success}}', { id: issue.id, b: body });
+  const body = `${who ? `${who} ` : ''}**Чака:** ${what}\n\n**Какво да направиш:** ${todo}\n\n**Ако не отговориш:** ${ifNot}${details ? `\n\n---\n\n${details}` : ''}`;
+  try {
+    await setState(task.issue, 'Чака Йоан');
+  } catch (error) {
+    log(`linear: ${error.message.slice(0, 300)}`);
+  }
+  await comment(task.issue, body);
 }
 
-// Tasks (or whole features) Yoan moved to Ready go into the queue; the rest of the work is the runner's.
-const skippedOnce = new Set();
+// A new start never reuses a branch or a copy of an earlier run (a closed PR, a task started over): -2, -3, ...
+function freeBranch(task) {
+  const repo = config.repos[task.repo];
+  const taken = (branch) => fs.existsSync(path.join(repo, '.claude', 'worktrees', branch))
+    || git(repo, ['branch', '--list', branch]) !== ''
+    || git(repo, ['ls-remote', '--heads', 'origin', branch]) !== '';
+  let branch = task.branch;
+  for (let n = 2; taken(branch); n += 1) branch = `${task.branch}-${n}`;
+  return branch;
+}
+
+const ISSUE_FIELDS = 'id identifier title description branchName state{name type} labels{nodes{name}} inverseRelations{nodes{type issue{identifier state{type}}}}';
+
+// Tasks Yoan moved to Ready go into the queue; a task blocked by an open one stays in Ready until it is free.
 async function takeReady() {
-  const data = await linear(
-    `query($team:String!){issues(first:50,filter:{team:{key:{eq:$team}},state:{name:{eq:"Ready"}},project:{null:false}}){nodes{${ISSUE_FIELDS} children(first:50){nodes{${ISSUE_FIELDS}}}}}}`,
-    { team: config.linearTeam ?? 'INV' },
-  );
+  const data = await linear(`query($team:String!){issues(first:50,filter:{team:{key:{eq:$team}},state:{name:{eq:"Ready"}}}){nodes{${ISSUE_FIELDS}}}}`, { team: config.linearTeam });
   if (!data) return;
-  const queue = readJson(QUEUE, []);
-  const known = new Set([...queue.map((t) => t.issue), ...fs.readdirSync(path.join(STATE, 'locks')).map((f) => f.replace(/\.lock$/, ''))]);
-  const { add, skip } = planFromReady(data.issues.nodes, known, (id) => path.join(STATE, 'briefs', `${id}.md`));
-  fs.mkdirSync(path.join(STATE, 'briefs'), { recursive: true });
-  for (const { briefText, ...task } of add) {
-    fs.writeFileSync(task.brief, `${briefText}\n`);
-    const latest = readJson(QUEUE, []);
-    latest.push(task);
-    fs.writeFileSync(QUEUE, JSON.stringify(latest, null, 2));
+  const known = new Set([...readQueue().map((t) => t.issue), ...activeLocks()]);
+  const { add, wait } = planFromReady(data.issues.nodes, known);
+  const entries = readLedger();
+  for (const { text, ...task } of add) {
+    if (!config.repos[task.repo] || !fs.existsSync(config.repos[task.repo])) {
+      logOnce(`repo:${task.issue}`, `linear: ${task.issue} is for ${task.repo}, which is not on this Mac`);
+      continue;
+    }
+    // A task Yoan stopped (Backlog, Canceled) and put back in Ready goes on where it stopped.
+    const last = [...entries].reverse().find((e) => e.issue === task.issue && ['stopped', 'merged', 'closed'].includes(e.status));
+    if (last?.status === 'stopped' && last.task) {
+      writeQueue([...readQueue(), { ...last.task, ...(['tests', 'tests-fix', 'code', 'fix'].includes(last.task.stage) ? { message: last.task.message ?? CONTINUE } : {}) }]);
+      await setState(task.issue, last.task.stage === 'review' ? 'In Review' : 'In Progress');
+      log(`linear: ${task.issue} goes on at ${last.task.stage}`);
+      continue;
+    }
+    const brief = path.join(STATE, 'briefs', `${task.issue}.md`);
+    fs.writeFileSync(brief, text);
+    const branch = freeBranch(task);
+    writeQueue([...readQueue(), { ...task, branch, brief, stage: 'tests', since: new Date().toISOString(), sessions: {} }]);
     await setState(task.issue, 'In Progress');
-    log(`linear: queued ${task.issue} on ${task.base}${task.dependsOn ? ` after ${task.dependsOn.join(', ')}` : ''}`);
+    log(`linear: queued ${task.issue} (${task.repo}${task.ui ? ', UI' : ''}) on ${branch}`);
   }
-  for (const { issue, why } of skip) {
-    if (skippedOnce.has(issue)) continue;
-    skippedOnce.add(issue);
-    log(`linear: ${issue} left in Ready (${why})`);
-  }
-  for (const feature of data.issues.nodes.filter((i) => (i.children?.nodes ?? []).length)) {
-    if (add.some((t) => t.base === `feature/${feature.identifier}`)) await setState(feature.identifier, 'In Progress');
-  }
+  for (const { issue, why } of wait) logOnce(`wait:${issue}:${why}`, `linear: ${issue} stays in Ready (${why})`);
 }
 
-// Yoan's answer in Linear to a question of the agent, or to a red CI, resumes the same session.
+// Yoan's answer in Linear puts the task back where it stopped.
 async function takeAnswers() {
   const data = await linear(
     'query($team:String!){issues(first:50,filter:{team:{key:{eq:$team}},state:{name:{eq:"Чака Йоан"}}}){nodes{identifier comments(last:30){nodes{body createdAt user{id}}}}}}',
-    { team: config.linearTeam ?? 'INV' },
+    { team: config.linearTeam },
   );
   if (!data) return;
   const yoanId = (await linear('{viewer{id}}', {}, { asYoan: true }))?.viewer?.id;
   const entries = readLedger();
-  const queue = readJson(QUEUE, []);
   for (const issue of data.issues.nodes) {
-    if (queue.some((t) => t.issue === issue.identifier)) continue;
-    const last = [...entries].reverse().find((e) => e.issue === issue.identifier && ['needs_answer', 'ci_failed', 'over_budget', 'answered'].includes(e.status));
-    if (!last || last.status === 'answered') continue;
-    if (last.status === 'over_budget' ? !last.task : !last.session) continue;
+    if (readQueue().some((t) => t.issue === issue.identifier)) continue;
+    const last = [...entries].reverse().find((e) => e.issue === issue.identifier && ['needs_answer', 'answered', 'merged', 'stopped'].includes(e.status));
+    if (last?.status !== 'needs_answer' || !last.task || last.kind === 'ui_check') continue;
     const answer = answerAfter(issue.comments.nodes, yoanId, last.ended);
     if (!answer) continue;
-    ledger({ issue: issue.identifier, ended: new Date().toISOString(), status: 'answered' });
-    if (last.status === 'over_budget') {
-      const decision = budgetAnswer(answer);
-      if (decision === 'stop') {
-        log(`linear: ${issue.identifier}: Yoan stops it at its cap`);
-        continue;
-      }
-      const task = { ...last.task, budgetUsd: last.capUsd + config.budgetUsd };
-      if (decision === 'continue-with-note' && task.resumeSession) {
-        task.message = `Yoan answered in Linear:\n\n${answer}\n\n${task.message ?? 'Continue exactly where you stopped and finish the same instructions.'}`;
-      }
-      const latest = readJson(QUEUE, []);
-      latest.unshift(task);
-      fs.writeFileSync(QUEUE, JSON.stringify(latest, null, 2));
-      await setState(issue.identifier, 'In Progress');
-      log(`linear: ${issue.identifier} goes on with a cap of $${task.budgetUsd}`);
+    ledger({ issue: issue.identifier, status: 'answered', kind: last.kind });
+    const item = resumeAfterAnswer(last, answer);
+    if (!item) {
+      ledger({ issue: issue.identifier, status: 'stopped', why: 'Yoan took it over or stopped it' });
+      log(`linear: ${issue.identifier}: Yoan takes it over or stops it`);
       continue;
     }
-    if (last.status === 'ci_failed' && /поемам/i.test(answer)) {
-      log(`linear: ${issue.identifier}: Yoan takes it over`);
-      continue;
-    }
-    const fix = last.status === 'ci_failed' ? `\n\n${fixMessage({ pr: last.pr, failed: last.failed ?? [], branch: last.branch, base: last.base })}` : '';
-    const latest = readJson(QUEUE, []);
-    latest.unshift({
-      issue: issue.identifier, branch: last.branch, base: last.base, resumeSession: last.session, ...(last.pr ? { pr: last.pr } : {}),
-      message: `Yoan answered in Linear:\n\n${answer}\n\nContinue with this answer and finish the same instructions.${fix}`,
-    });
-    fs.writeFileSync(QUEUE, JSON.stringify(latest, null, 2));
-    await setState(issue.identifier, 'In Progress');
-    log(`linear: ${issue.identifier} resumes with Yoan's answer`);
+    if (last.kind === 'review_question') await addAnswerToPr(item, last, answer);
+    writeQueue([item, ...readQueue()]);
+    await setState(issue.identifier, item.stage === 'review' ? 'In Review' : 'In Progress');
+    log(`linear: ${issue.identifier} goes on with Yoan's answer (${last.kind})`);
   }
 }
 
-let lastSync = 0;
-async function comment(issueKey, body) {
-  const issue = (await linear('query($id:String!){issue(id:$id){id}}', { id: issueKey }))?.issue;
-  if (issue) await linear('mutation($id:String!,$b:String!){commentCreate(input:{issueId:$id,body:$b}){success}}', { id: issue.id, b: body });
+// Where a task goes on after Yoan's answer, by what it waited for; null when he stops it or takes it over.
+function resumeAfterAnswer(last, answer) {
+  const task = { ...last.task, guardRetry: undefined };
+  const said = `Yoan answered in Linear:\n\n${answer}`;
+  if (/^(поемам|спри)[\s.!]*$/iu.test(answer.trim())) return null;
+  switch (last.kind) {
+    case 'over_budget': {
+      const decision = budgetAnswer(answer);
+      if (decision === 'stop') return null;
+      return { ...task, budgetUsd: (task.budgetUsd ?? config.budgetUsd) + config.budgetUsd, ...(decision === 'continue-with-note' ? { message: `${said}\n\n${task.message ?? CONTINUE}` } : {}) };
+    }
+    case 'review_question':
+      return { ...task, stage: 'fix', message: `The reviewer asked a question about your PR and ${said}\n\nChange the code if the answer asks for it, then end with what you changed (in Bulgarian, at most 5 lines) and RESULT: DONE. If nothing has to change, end with RESULT: DONE as well.` };
+    case 'rounds':
+      return { ...task, stage: 'fix', round: 0, message: `${said}\n\nFix the PR with this answer, under the same rules, and end with what you changed (in Bulgarian, at most 5 lines) and RESULT: DONE.` };
+    case 'dispute':
+      return { ...task, stage: 'tests-fix', message: `${task.message ?? ''}\n\n${said}\n\nThis settles the disagreement about the test. Change the test if the answer says so (RESULT: DONE), or keep it and say so for the implementer (RESULT: KEEP).`.trim() };
+    case 'review_stuck':
+      return { ...task, stage: 'review', reviewReruns: undefined, reviewSince: new Date().toISOString() };
+    default:
+      return { ...task, message: `${said}\n\nContinue with this answer and finish the same instructions, ending with the RESULT line.` };
+  }
+}
+
+// The reviewer reads the PR's description as its brief, so Yoan's answer goes there too.
+async function addAnswerToPr(item, last, answer) {
+  try {
+    const cwd = repoDir(item);
+    const body = await gh(['pr', 'view', item.pr, '--json', 'body', '-q', '.body'], { cwd });
+    const file = path.join(os.tmpdir(), `invoicely-pr-${item.issue}-answer.md`);
+    fs.writeFileSync(file, `${body}\n\n## Отговор на Йоан на въпроса на reviewer-а\n\n${answer}\n`);
+    try {
+      await gh(['pr', 'edit', item.pr, '--body-file', file], { asBot: true, cwd });
+    } finally {
+      fs.rmSync(file, { force: true });
+    }
+  } catch (error) {
+    log(`${item.issue}: the answer did not reach the PR: ${error.message.split('\n')[0]}`);
+  }
 }
 
 // One writer for the status of the runner's tasks (INV-50): the queue says where a task is and Linear shows it.
-// A task in the queue is In Progress, or In Review while its PR waits for CI. A "Чака Йоан" whose reason is gone
-// (the task is back in the queue) is closed with a note. A task Yoan moved back to Backlog or Canceled leaves the
-// queue: Ready is the "go" button, and moving it back is "stop". A feature closed while its subtasks still run (the
-// GitHub integration closes an issue named in a merged PR's title) is opened again.
+// Backlog or Canceled is Yoan's "stop": the task leaves the queue.
 async function reconcileStatuses() {
-  const queue = readJson(QUEUE, []);
-  for (const task of queue) {
+  for (const task of readQueue()) {
     const state = (await linear('query($id:String!){issue(id:$id){state{name type}}}', { id: task.issue }))?.issue?.state;
     if (!state) continue;
     const { action, want, note } = statusAction(task, state);
     if (action === 'remove') {
       updateItem(task.issue, null);
-      ledger({ issue: task.issue, branch: task.branch, base: task.base || 'main', ended: new Date().toISOString(), status: 'stopped', state: state.name });
-      await comment(task.issue, `**Спряно.** Задачата е в ${state.name}, затова runner-ът я извади от опашката. Върни я в Ready, за да продължи.`);
+      ledger({ issue: task.issue, branch: task.branch, status: 'stopped', state: state.name, task: { ...task, waitUntil: undefined } });
+      await comment(task.issue, `**Спряно.** Задачата е в ${state.name}, затова runner-ът я извади от опашката. Върни я в Ready, за да продължи оттам, докъдето стигна.`);
       log(`linear: ${task.issue} is in ${state.name}, taken out of the queue`);
     } else if (action === 'set') {
       await setState(task.issue, want);
-      if (note) {
-        await comment(task.issue, `**Вече не чака теб.** Задачата е пак в опашката на runner-а: ${task.stage === 'ci' ? 'PR-ът чака CI' : 'чака ред или зависимост'}.`);
-        log(`linear: ${task.issue} no longer waits for Yoan, ${want}`);
-      }
+      if (note) await comment(task.issue, `**Вече не чака теб.** Задачата е пак в опашката на runner-а (${want}).`);
     }
-  }
-  for (const base of new Set(readJson(QUEUE, []).map((t) => t.base).filter(isFeatureBranch))) {
-    const id = base.slice('feature/'.length);
-    const state = (await linear('query($id:String!){issue(id:$id){state{type}}}', { id }))?.issue?.state;
-    if (state?.type !== 'completed') continue;
-    await setState(id, 'In Progress');
-    await comment(id, `**Отворено отново.** Подзадачите още вървят в \`${base}\`. Функционалността е готова, когато PR-ът ѝ към main се слее.`);
-    log(`linear: ${id} opened again, its subtasks still run`);
   }
 }
 
-// When every subtask of a feature is merged into feature/<id>, the runner opens one PR from it to main for Yoan
-// and the feature waits for him there (INV-54). Checked every round for the features merged into in the last week,
-// because Linear marks a merged subtask Done a little after the merge.
-async function openFeaturePrs() {
-  const week = Date.now() - 7 * 24 * 60 * 60 * 1000;
-  const bases = new Set(readLedger().filter((e) => e.status === 'merged' && isFeatureBranch(e.base) && Date.parse(e.ended) >= week).map((e) => e.base));
-  const done = new Set(readLedger().filter((e) => e.status === 'feature_pr').map((e) => e.branch));
-  for (const base of bases) {
-    if (done.has(base)) continue;
-    const id = base.slice('feature/'.length);
-    const feature = (await linear('query($id:String!){issue(id:$id){identifier title children(first:50){nodes{identifier title state{type}}}}}', { id }))?.issue;
-    if (!feature || !featureReady(feature.children?.nodes ?? [], readJson(QUEUE, []), base)) continue;
-    const open = await gh(['pr', 'list', '--head', base, '--base', 'main', '--state', 'open', '--json', 'url'], { json: true });
-    let url = open[0]?.url;
-    if (!url) {
-      const merged = await gh(['pr', 'list', '--base', base, '--state', 'merged', '--limit', '100', '--json', 'number,title,url'], { json: true });
-      const file = path.join(os.tmpdir(), `invoicely-feature-${id}.md`);
-      fs.writeFileSync(file, featurePrBody({ feature, children: feature.children.nodes, merged, repo: path.basename(config.repo) }));
-      try {
-        url = findPrUrl(await gh(['pr', 'create', '--base', 'main', '--head', base, '--title', `${id}: ${feature.title}`, '--body-file', file], { asBot: true }));
-      } finally {
-        fs.rmSync(file, { force: true });
-      }
-    }
-    if (!url) continue;
-    ledger({ issue: id, branch: base, base: 'main', ended: new Date().toISOString(), status: 'feature_pr', pr: url });
-    await askYoan(id, `одобрение на PR-а на функционалността: ${url}. Всички подзадачи са слети във \`${base}\`.`,
-      'прочети резюмето най-горе в PR-а, тествай по "Какво да тестваш" и одобри в GitHub. Предложение: одобри, ако CI е зелен и тестът минава.',
-      'функционалността остава във feature клона и не стига до main.');
-    log(`${id}: all subtasks merged, feature PR ${url}`);
-  }
-}
-
+let lastSync = 0;
 async function syncFromLinear() {
   if (Date.now() - lastSync < 5 * 60 * 1000) return;
   lastSync = Date.now();
@@ -898,7 +904,6 @@ async function syncFromLinear() {
     await takeAnswers();
     await takeReady();
     await reconcileStatuses();
-    await openFeaturePrs();
   } catch (error) {
     log(`linear sync: ${error.message.slice(0, 300)}`);
   }
@@ -906,15 +911,11 @@ async function syncFromLinear() {
 
 // --- Clean-up (INV-48): copies and branches of finished tasks go; see janitor.mjs for the rules ---
 
-function repoSlug() {
-  return /github\.com[:/](.+?)(?:\.git)?$/.exec(git(config.repo, ['remote', 'get-url', 'origin']))?.[1];
-}
-
-async function cleanupFacts({ fetch }) {
-  if (fetch) git(config.repo, ['fetch', '-q', '--prune', 'origin']);
-  const managed = [config.worktrees, config.legacyWorktrees];
-  const copies = parseWorktrees(git(config.repo, ['worktree', 'list', '--porcelain']))
-    .filter((w) => managed.includes(path.dirname(w.path)))
+async function cleanupFacts(repo, { fetch }) {
+  if (fetch) git(repo, ['fetch', '-q', '--prune', 'origin']);
+  const holder = path.join(repo, '.claude', 'worktrees');
+  const copies = parseWorktrees(git(repo, ['worktree', 'list', '--porcelain']))
+    .filter((w) => path.dirname(w.path) === holder)
     .map((w) => {
       let dirty = true;
       try {
@@ -922,7 +923,6 @@ async function cleanupFacts({ fetch }) {
       } catch {
         // a copy git cannot read is treated as holding work
       }
-      // Age since the copy was made, not since its last commit: a new copy's last commit is its base's.
       let ageDays = 0;
       try {
         const st = fs.statSync(w.path);
@@ -932,20 +932,20 @@ async function cleanupFacts({ fetch }) {
       }
       return { ...w, dirty, ageDays };
     });
-  const refs = (prefix) => git(config.repo, ['for-each-ref', prefix, '--format=%(refname:short) %(objectname)'])
+  const refs = (prefix) => git(repo, ['for-each-ref', prefix, '--format=%(refname:short) %(objectname)'])
     .split('\n').filter(Boolean).map((line) => { const [name, head] = line.split(' '); return { name, head }; });
   const remoteBranches = refs('refs/remotes/origin').filter((b) => b.name.startsWith('origin/') && b.name !== 'origin/HEAD')
     .map((b) => ({ name: b.name.slice('origin/'.length), head: b.head }));
-  const prs = await gh(['pr', 'list', '--state', 'all', '--limit', '500', '--json', 'number,headRefName,headRefOid,baseRefName,state'], { json: true });
-  // The plugin's copy, the copy this runner runs from, and the main checkout are never touched.
-  const protectedPaths = [path.join(config.legacyWorktrees, 'plugin-runtime'), path.dirname(HERE), config.repo];
-  return { copies, prs, localBranches: refs('refs/heads'), remoteBranches, protectedPaths, queue: readJson(QUEUE, []) };
+  const prs = await gh(['pr', 'list', '--state', 'all', '--limit', '500', '--json', 'number,headRefName,headRefOid,baseRefName,state'], { json: true, cwd: repo });
+  // The plugin's copy, the copy this runner runs from, and the main checkouts are never touched.
+  const protectedPaths = [config.plugin, path.dirname(HERE), ...Object.values(config.repos)];
+  return { copies, prs, localBranches: refs('refs/heads'), remoteBranches, protectedPaths, queue: readQueue().filter((t) => repoDir(t) === repo) };
 }
 
-async function cleanup({ only = null, dryRun = false } = {}) {
+async function cleanup({ repo, only = null, dryRun = false }) {
   let facts;
   try {
-    facts = await cleanupFacts({ fetch: !dryRun });
+    facts = await cleanupFacts(repo, { fetch: !dryRun });
   } catch (error) {
     logOnce(`cleanup:${error.message.split('\n')[0]}`, `cleanup: ${error.message.split('\n')[0]}`);
     return null;
@@ -968,10 +968,10 @@ async function cleanup({ only = null, dryRun = false } = {}) {
     }
   };
   for (const c of plan.removeCopies) {
-    if (tried(c.path, () => git(config.repo, ['worktree', 'remove', c.path]))) { done.copies += 1; log(`cleanup: removed ${c.path} (${c.why})`); }
+    if (tried(c.path, () => git(repo, ['worktree', 'remove', c.path]))) { done.copies += 1; log(`cleanup: removed ${c.path} (${c.why})`); }
   }
-  for (const name of plan.deleteLocal) if (tried(name, () => git(config.repo, ['branch', '-D', name]))) done.local += 1;
-  const slug = plan.deleteRemote.length ? repoSlug() : null;
+  for (const name of plan.deleteLocal) if (tried(name, () => git(repo, ['branch', '-D', name]))) done.local += 1;
+  const slug = plan.deleteRemote.length ? repoSlug(repo) : null;
   for (const name of plan.deleteRemote) {
     try {
       await gh(['api', '-X', 'DELETE', `repos/${slug}/git/refs/heads/${name}`], { asBot: true });
@@ -980,22 +980,9 @@ async function cleanup({ only = null, dryRun = false } = {}) {
       log(`cleanup: origin/${name}: ${error.message.split('\n')[0]}`);
     }
   }
-  if (!only) {
-    tried('worktree prune', () => git(config.repo, ['worktree', 'prune']));
-    const logsDir = path.join(STATE, 'logs');
-    const files = fs.readdirSync(logsDir).map((name) => ({ name, mtimeMs: fs.statSync(path.join(logsDir, name)).mtimeMs }));
-    for (const name of oldLogs(files, new Date())) if (tried(name, () => fs.rmSync(path.join(logsDir, name)))) done.logs += 1;
-    // The copy of a brief goes when its task is merged or closed and no longer queued; Linear keeps the brief.
-    const last = new Map();
-    for (const e of readLedger()) if (e.issue && e.status !== 'ci-evals') last.set(e.issue, e.status);
-    const briefs = path.join(STATE, 'briefs');
-    for (const file of fs.existsSync(briefs) ? fs.readdirSync(briefs) : []) {
-      const issue = file.replace(/\.md$/, '');
-      if (!facts.queue.some((t) => t.issue === issue) && ['merged', 'closed'].includes(last.get(issue))) tried(file, () => fs.rmSync(path.join(briefs, file)));
-    }
-  }
+  if (!only) tried('worktree prune', () => git(repo, ['worktree', 'prune']));
   for (const kept of plan.report) await reportCopyKept(kept);
-  if (done.copies + done.local + done.remote + done.logs > 0) log(`cleanup: ${cleanupSummary(plan, done)}`);
+  if (done.copies + done.local + done.remote > 0) log(`cleanup ${path.basename(repo)}: ${cleanupSummary(plan, done)}`);
   return { plan, done };
 }
 
@@ -1006,182 +993,94 @@ async function reportCopyKept(kept) {
   if ((state.told ?? []).includes(kept.path)) return;
   const issue = /^inv-(\d+)/i.exec(kept.branch)?.[1];
   log(`cleanup: kept ${kept.path}: ${kept.why}`);
-  if (issue) {
-    try {
-      const found = (await linear('query($id:String!){issue(id:$id){id}}', { id: `INV-${issue}` }))?.issue;
-      if (found) {
-        await linear('mutation($id:String!,$body:String!){commentCreate(input:{issueId:$id,body:$body}){success}}', {
-          id: found.id,
-          body: `**Копието остава на диска:** \`${kept.path}\`. ${kept.bg ?? kept.why}. Нищо не се губи; копието се маха, щом работата в него бъде записана или вече не трябва.`,
-        });
-      }
-    } catch (error) {
-      log(`linear: ${error.message}`);
-    }
-  }
+  if (issue) await comment(`INV-${issue}`, `**Копието остава на диска:** \`${kept.path}\`. ${kept.bg ?? kept.why}. Нищо не се губи; копието се маха, щом работата в него бъде записана или вече не трябва.`);
   state.told = [...(state.told ?? []).slice(-50), kept.path];
   fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
 }
 
-// Once a day, after the night window, and never while a session runs.
+// Once a day, when no session runs: every repo's finished copies and branches, and logs older than 30 days.
 async function maybeCleanup() {
-  const now = new Date();
-  if (inWindow(now, config.windowStart, config.windowEnd)) return;
   const stateFile = path.join(STATE, 'cleanup.json');
-  const today = now.toLocaleDateString('sv-SE');
-  if (readJson(stateFile, {}).lastRun === today) return;
-  if (activeLocks().length > 0) return;
-  retireOldCopies();
-  const result = await cleanup();
-  if (!result) return; // GitHub or git failed: tried again next round
+  const today = new Date().toLocaleDateString('sv-SE');
+  if (readJson(stateFile, {}).lastRun === today || activeLocks().length > 0) return;
+  const texts = [];
+  for (const repo of Object.values(config.repos)) {
+    if (!fs.existsSync(repo)) continue;
+    const result = await cleanup({ repo });
+    if (!result) return; // GitHub or git failed: tried again next round
+    texts.push(`${path.basename(repo)}: ${cleanupSummary(result.plan, result.done)}`);
+  }
+  const logsDir = path.join(STATE, 'logs');
+  const files = fs.readdirSync(logsDir).map((name) => ({ name, mtimeMs: fs.statSync(path.join(logsDir, name)).mtimeMs }));
+  for (const name of oldLogs(files, new Date())) fs.rmSync(path.join(logsDir, name), { force: true });
   const state = readJson(stateFile, {});
-  state.lastRun = today;
-  state.summary = { day: today, text: cleanupSummary(result.plan, result.done) };
-  fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+  fs.writeFileSync(stateFile, JSON.stringify({ ...state, lastRun: today, summary: { day: today, text: texts.join(' ') } }, null, 2));
 }
 
 // Before each round: the main checkout follows origin/main, so that merged changes to the runner and the agents take
-// effect. It is fast-forwarded only when it is on main with no changes to tracked files. When the runner's own code
-// changed, a runner under launchd exits and launchd starts it again with the new code.
+// effect. When the runner's own code changed, a runner under launchd exits and launchd starts the new code.
 function updateRunnerCode() {
   if (!RUNS_FROM_REPO || !startCommit) return;
   try {
-    const branch = git(config.repo, ['symbolic-ref', '--short', 'HEAD']);
-    const dirty = git(config.repo, ['status', '--porcelain', '--untracked-files=no']) !== '';
+    const branch = git(AGENTS_REPO, ['symbolic-ref', '--short', 'HEAD']);
+    const dirty = git(AGENTS_REPO, ['status', '--porcelain', '--untracked-files=no']) !== '';
     if (branch !== 'main' || dirty) {
       logOnce(`repo:${branch}:${dirty}`, `the main checkout is ${dirty ? 'changed' : `on ${branch}`}; it is not updated until it is clean main again`);
       return;
     }
-    git(config.repo, ['fetch', '-q', 'origin']);
-    git(config.repo, ['merge', '-q', '--ff-only', 'origin/main']);
-    if (git(config.repo, ['diff', '--name-only', startCommit, 'HEAD', '--', 'factory/']) === '') return;
+    git(AGENTS_REPO, ['fetch', '-q', 'origin']);
+    git(AGENTS_REPO, ['merge', '-q', '--ff-only', 'origin/main']);
+    if (git(AGENTS_REPO, ['diff', '--name-only', startCommit, 'HEAD', '--', 'factory/', 'hooks/lib/']) === '') return;
     if (process.env.INVOICELY_SERVICE === '1') {
       log('the runner code changed in main; exiting so that launchd starts the new code');
       process.exit(0);
     }
-    logOnce(`code:${git(config.repo, ['rev-parse', 'HEAD'])}`, 'the runner code changed in main; restart the runner to use it');
+    logOnce(`code:${git(AGENTS_REPO, ['rev-parse', 'HEAD'])}`, 'the runner code changed in main; restart the runner to use it');
   } catch (error) {
     logOnce(`update:${error.message.split('\n')[0]}`, `update: ${error.message.split('\n')[0]}`);
   }
 }
 
-// The two copies the runner needed before INV-49 go once it runs from the repo: the plugin's old copy and the
-// runner's old copy in ~/projects/ia-wt. Only when clean, and the runner's old copy only once the bot tools no
-// longer load code from it. The old folder goes when it is empty. The copy guard stops removing them by hand.
-function retireOldCopies() {
-  // Never while paused or while a session runs: an old session may still load its plugin from plugin-runtime.
-  if (!RUNS_FROM_REPO || fs.existsSync(PAUSED) || activeLocks().length > 0) return;
-  const tools = path.join(STATE, 'tools');
-  const usedByTools = (dir) => fs.existsSync(tools) && fs.readdirSync(tools).some((f) => f.endsWith('.mjs') && fs.readFileSync(path.join(tools, f), 'utf8').includes(dir));
-  for (const name of ['plugin-runtime', 'factory-runner']) {
-    const old = path.join(config.legacyWorktrees, name);
-    if (!fs.existsSync(old)) continue;
-    if (usedByTools(old)) {
-      logOnce(`tools:${old}`, `kept ${old}: a bot tool in ${tools} still loads code from it`);
-      continue;
-    }
-    try {
-      if (git(old, ['status', '--porcelain']) !== '') {
-        logOnce(`changed:${old}`, `kept ${old}: it has changes`);
-        continue;
-      }
-      git(config.repo, ['worktree', 'remove', old]);
-      log(`removed ${old}: the runner runs from ${config.repo}, the plugin loads from ${config.plugin}`);
-    } catch (error) {
-      log(`${old}: ${error.message.split('\n')[0]}`);
-    }
-  }
+// --- The loop ---
+
+// The Max limit is shared by every session: once one hits it, no new session starts before the reset.
+let limitUntil = 0;
+
+async function runStep(task) {
+  const unlock = lock(task.issue);
   try {
-    if (fs.existsSync(config.legacyWorktrees) && fs.readdirSync(config.legacyWorktrees).every((f) => f === '.DS_Store')) {
-      fs.rmSync(config.legacyWorktrees, { recursive: true });
-      log(`removed the empty ${config.legacyWorktrees}`);
-    }
-  } catch (error) {
-    log(`${config.legacyWorktrees}: ${error.message}`);
+    if (task.stage === 'tests' || task.stage === 'tests-fix') await stepTests(task);
+    else if (task.stage === 'publish') await publish(task);
+    else await stepCode(task);
+    updateItem(task.issue, { startFailures: undefined });
+  } finally {
+    unlock();
   }
 }
 
-// The same line every 5 minutes says nothing new: a state is logged once.
-const loggedOnce = new Set();
-function logOnce(key, message) {
-  if (loggedOnce.has(key)) return;
-  loggedOnce.add(key);
-  log(message);
-}
-
-// A task over its cap leaves the queue and asks Yoan (INV-47). The entry keeps the task as it was, so that
-// "продължи" puts it back with one more default budget.
-async function stopOverBudget(task, spent, cap) {
-  const entry = {
-    issue: task.issue, branch: task.branch, base: task.base || 'main', ended: new Date().toISOString(), status: 'over_budget',
-    spentUsd: Math.round(spent * 100) / 100, capUsd: cap, session: task.resumeSession ?? task.session ?? null, task,
-    ...(task.pr ? { pr: task.pr } : {}),
-  };
-  ledger(entry);
-  updateItem(task.issue, null);
-  log(`${task.issue}: over its cap ($${entry.spentUsd} of $${cap}), taken out of the queue`);
-  await reportToLinear(entry, '');
-}
-
-async function runQueue(now) {
-  retireOldCopies();
+async function runQueue() {
   for (;;) {
     if (fs.existsSync(PAUSED)) {
-      logOnce(`paused:${fs.statSync(PAUSED).mtimeMs}`, 'paused: no sessions, CI merges or clean-up until `factory resume`');
+      logOnce(`paused:${fs.statSync(PAUSED).mtimeMs}`, 'paused: no sessions, merges or clean-up until `factory resume`');
       await sleep(60 * 1000);
       continue;
     }
     updateRunnerCode();
     await syncFromLinear();
-    await processCi();
+    await processReviews();
     await maybeCleanup();
-    let queue = readJson(QUEUE, []);
-    if (queue.length === 0) {
-      await reportNight('Опашката е празна.');
-      await sleep(5 * 60 * 1000); // keep watching Linear for tasks in Ready
-      continue;
-    }
-    const merged = await mergedByBase(queue);
-    await dropBlocked(queue, merged);
-    queue = readJson(QUEUE, []);
-    const waitingForCi = queue.some((t) => t.stage === 'ci');
-    const task = nextRunnable(queue, merged);
+    const queue = readQueue();
+    const task = Date.now() < limitUntil ? null : nextRunnable(queue);
     if (!task) {
-      if (!waitingForCi) await reportNight('Нищо не може да тръгне: всяка задача чака зависимост.');
-      await sleep((waitingForCi ? 2 : 5) * 60 * 1000);
+      await sleep((queue.length ? 2 : 5) * 60 * 1000);
       continue;
     }
-    // Checked at any hour, like CI: a PR fixed by day goes back to waiting for CI and is merged by day.
-    if (task.pr && task.fixRounds && task.message && !(await fixStillNeeded(task))) continue;
-    if (!now && !inWindow(new Date(), config.windowStart, config.windowEnd)) {
-      await reportNight(`Нощта свърши. В опашката остават: ${queue.map((t) => `${t.issue}${t.stage === 'ci' ? ' (чака CI)' : ''}`).join(', ')}.`);
-      // By day: no sessions, but CI, merges and Linear (answers, tasks in Ready) are still followed every 5 minutes.
-      await sleep(Math.min(5 * 60 * 1000, nextWindowStart(new Date(), config.windowStart) - Date.now()));
-      continue;
-    }
-    // Two caps (INV-47): the task's, over all its sessions, and the period's (night or day), sessions and CI evals
-    // together. A session never gets more than what is left of either, also when started with --now.
-    const entries = readLedger();
-    const period = spendingPeriod(new Date(), config);
-    const periodSpent = spentSince(entries, period.start);
-    const taskCap = task.budgetUsd ?? config.budgetUsd;
-    const spentOnTask = taskSpent(entries, task.issue);
-    const { budget, stoppedBy } = sessionBudget({ taskCap, taskSpent: spentOnTask, periodCap: period.cap, periodSpent });
-    if (budget === 0 && stoppedBy === 'task') {
-      await stopOverBudget(task, spentOnTask, taskCap);
-      continue;
-    }
-    if (budget === 0) {
-      logOnce(`cap:${period.kind}:${period.start.toISOString()}`, `${period.kind} cap reached: $${periodSpent.toFixed(2)} of $${period.cap}; no new session until the next period`);
-      await sleep(5 * 60 * 1000);
-      continue;
-    }
-    let result;
     try {
-      result = await runTask(task, budget);
+      await runStep(task);
     } catch (error) {
-      // A run that could not even start (no network after the Mac wakes, GitHub down) keeps its place in the queue
-      // and is tried again in 5 minutes; only after 6 failed starts in a row is it taken out.
+      if (error instanceof OverBudget) continue;
+      // A step that could not even start (no network after the Mac wakes, GitHub down) keeps its place and is tried
+      // again in 5 minutes; after 6 failed starts in a row Yoan is asked.
       const failures = (task.startFailures ?? 0) + 1;
       log(`${task.issue}: could not run (${failures}/6): ${error.message.split('\n')[0]}`);
       if (failures < 6) {
@@ -1189,34 +1088,29 @@ async function runQueue(now) {
         await sleep(5 * 60 * 1000);
         continue;
       }
-      ledger({ issue: task.issue, branch: task.branch, ended: new Date().toISOString(), status: 'error', error: error.message });
-      result = { status: 'error' };
-    }
-    const pr = result.pr || task.pr;
-    if (result.status === 'limit' && result.reset) {
-      updateItem(task.issue, { resumeSession: result.session, message: undefined, startFailures: undefined });
-      await sleepUntil(new Date(result.reset.getTime() + 3 * 60 * 1000));
-    } else if (isFeatureBranch(task.base) && pr && (result.status === 'done' || (task.pr && result.status === 'needs_answer'))) {
-      updateItem(task.issue, { stage: 'ci', pr, session: result.session || task.session, ciSince: new Date().toISOString(), resumeSession: undefined, message: undefined });
-      log(`${task.issue}: waiting for CI on ${pr}`);
-    } else {
-      updateItem(task.issue, null);
+      updateItem(task.issue, { startFailures: undefined });
+      await askYoan(task, {
+        kind: 'error', role: null, what: 'runner-ът не може да пусне стъпката 6 пъти подред.',
+        todo: 'виж грешката по-долу и пиши тук "опитай пак", когато е наред. Предложение: "опитай пак".', ifNot: 'задачата стои.',
+        details: error.message.slice(0, 1500),
+      });
     }
   }
 }
 
-// The runner as a launchd service: starts at login, starts again when it stops (a crash, or new code in main),
-// logs to runner.log. Install it once, after the manual runner is stopped.
+// --- The service and the CLI ---
+
+// The runner as a launchd service: starts at login, starts again when it stops (a crash, or new code in main).
 const LABEL = 'com.invoicely.runner';
 function service(sub) {
   const plistFile = path.join(HOME, 'Library', 'LaunchAgents', `${LABEL}.plist`);
   const domain = `gui/${process.getuid()}`;
   if (sub === 'install') {
-    if (!RUNS_FROM_REPO) return console.log(`install the service from the main checkout: node ${path.join(config.repo, 'factory', 'factory.mjs')} service install`);
+    if (!RUNS_FROM_REPO) return console.log(`install the service from the main checkout: node ${path.join(AGENTS_REPO, 'factory', 'factory.mjs')} service install`);
     const nodeBin = config.nodeBin || path.dirname(process.execPath);
     fs.mkdirSync(path.dirname(plistFile), { recursive: true });
     fs.writeFileSync(plistFile, servicePlist({
-      label: LABEL, node: path.join(nodeBin, 'node'), script: path.join(config.repo, 'factory', 'factory.mjs'), cwd: config.repo,
+      label: LABEL, node: path.join(nodeBin, 'node'), script: path.join(AGENTS_REPO, 'factory', 'factory.mjs'), cwd: AGENTS_REPO,
       logFile: path.join(STATE, 'logs', 'runner.log'), pathEnv: `${nodeBin}:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`, home: HOME,
     }));
     execFileSync('launchctl', ['bootstrap', domain, plistFile], { stdio: 'inherit' });
@@ -1235,25 +1129,19 @@ function service(sub) {
     const out = execFileSync('launchctl', ['print', `${domain}/${LABEL}`], { stdio: ['ignore', 'pipe', 'ignore'] }).toString();
     return console.log(out.split('\n').filter((l) => /state =|pid =|last exit code/.test(l)).map((l) => l.trim()).join('\n'));
   } catch {
-    return console.log(`${LABEL} is not installed (factory service install)`);
+    return console.log(`${LABEL} is not loaded (factory service install, or launchctl bootstrap gui/$(id -u) ${plistFile})`);
   }
 }
 
 async function main() {
-  // An agent must not drive the runner (its queue, Linear as the app, the service), for example through
-  // `node hooks/../factory/factory.mjs`: the runner marks every agent session and refuses to run inside one.
+  // An agent must not drive the runner (its queue, Linear as the app, the service): the runner marks every agent
+  // session and refuses to run inside one.
   if (process.env.INVOICELY_AGENT_SESSION === '1') {
     process.stderr.write('factory: not available inside an agent session\n');
     process.exit(1);
   }
   const [command, sub, ...rest] = process.argv.slice(2);
-  if (command === 'queue' && sub === 'add') {
-    const queue = readJson(QUEUE, []);
-    queue.push(parseTask(rest));
-    fs.writeFileSync(QUEUE, JSON.stringify(queue, null, 2));
-    return log(`queued ${rest[0]} (${queue.length} in queue)`);
-  }
-  if (command === 'queue' && sub === 'run') return runQueue(rest.includes('--now'));
+  if (command === 'queue' && sub === 'run') return runQueue();
   if (command === 'pause') {
     fs.writeFileSync(PAUSED, `${new Date().toISOString()}\n`);
     console.log('paused: the runner finishes the session that runs now and then starts nothing until `factory resume`');
@@ -1262,7 +1150,7 @@ async function main() {
         console.log(`waiting for ${activeLocks().join(', ')} to finish`);
         await sleep(60 * 1000);
       }
-      console.log('no session runs: the copies may be worked on');
+      console.log('no session runs');
     }
     return undefined;
   }
@@ -1270,32 +1158,17 @@ async function main() {
     fs.rmSync(PAUSED, { force: true });
     return console.log('resumed');
   }
-  // Puts a task back from the ledger, instead of editing queue.json by hand: --ci to wait for its PR's CI and merge
-  // it when green, otherwise to resume its session (with --message <text>).
   if (command === 'requeue') {
-    const issue = sub;
-    const entries = readLedger().filter((e) => e.issue === issue);
-    const last = [...entries].reverse().find((e) => e.branch);
-    if (!issue || !last) return console.log(`usage: factory requeue <INV-xx> [--ci | --message <text>]; no run of ${issue ?? '?'} in the ledger`);
-    if (readJson(QUEUE, []).some((t) => t.issue === issue)) return console.log(`${issue} is already in the queue`);
-    const session = [...entries].reverse().find((e) => e.session)?.session;
-    const pr = [...entries].reverse().find((e) => e.pr)?.pr;
-    const worktree = [...entries].reverse().find((e) => e.worktree)?.worktree;
+    const last = [...readLedger()].reverse().find((e) => e.issue === sub && e.task);
+    if (!sub || !last) return console.log(`usage: factory requeue <INV-xx> [--message <text>]; ${sub ?? '?'} has no saved step in the ledger`);
+    if (readQueue().some((t) => t.issue === sub)) return console.log(`${sub} is already in the queue`);
     const at = rest.indexOf('--message');
-    const item = rest.includes('--ci')
-      ? { issue, branch: last.branch, base: last.base, stage: 'ci', pr, session, ciSince: new Date().toISOString(), fixRounds: 1, worktree }
-      : { issue, branch: last.branch, base: last.base, resumeSession: session, pr, worktree, message: at >= 0 ? rest[at + 1] : undefined };
-    if (item.stage === 'ci' && !pr) return console.log(`${issue} has no PR in the ledger`);
-    for (const key of Object.keys(item)) if (item[key] === undefined) delete item[key];
-    const queue = readJson(QUEUE, []);
-    queue.unshift(item);
-    fs.writeFileSync(QUEUE, JSON.stringify(queue, null, 2));
-    return log(`requeued ${issue}${item.stage === 'ci' ? ` to wait for CI on ${pr}` : ''}`);
+    const item = resumeAfterAnswer(last, at >= 0 ? rest[at + 1] : 'опитай пак') ?? last.task;
+    writeQueue([item, ...readQueue()]);
+    return log(`requeued ${sub} at ${item.stage}`);
   }
   if (command === 'service') return service(sub);
-  // Claude in an interactive session writes in Linear as the app, not as Yoan (INV-50): Yoan gets a notification and
-  // the history shows who wrote what. ask: a question in three parts that mentions Yoan and moves the task to
-  // "Чака Йоан"; comment: a note; state: a status.
+  // Claude in an interactive session writes in Linear as the app, not as Yoan (INV-50).
   if (command === 'linear') {
     const [issueKey, ...more] = rest;
     const at = more.indexOf('--body-file');
@@ -1306,9 +1179,8 @@ async function main() {
       return console.log(`${issueKey}: ${more.join(' ')}`);
     }
     if (!body) return console.log('--body-file <file> is needed');
-    // One writer: a task in the runner's queue is the runner's, and its status check would undo the question.
-    if (sub === 'ask' && readJson(QUEUE, []).some((t) => t.issue === issueKey)) {
-      return console.log(`${issueKey} is in the runner's queue, so its status is the runner's: write a note with \`factory linear comment\`; questions about it come from its agent`);
+    if (sub === 'ask' && readQueue().some((t) => t.issue === issueKey)) {
+      return console.log(`${issueKey} is in the runner's queue, so its status is the runner's: write a note with \`factory linear comment\``);
     }
     if (sub === 'ask') {
       const who = await yoanMention();
@@ -1321,36 +1193,37 @@ async function main() {
   }
   if (command === 'clean') {
     const dryRun = sub === '--dry-run' || rest.includes('--dry-run');
-    const result = await cleanup({ dryRun });
-    if (!result) return undefined;
-    const { plan } = result;
-    for (const c of plan.removeCopies) console.log(`${dryRun ? 'would remove' : 'removed'} copy ${c.path} (${c.why})`);
-    for (const c of plan.keepCopies) console.log(`keep copy ${c.path}: ${c.why}`);
-    if (plan.deleteLocal.length) console.log(`${dryRun ? 'would delete' : 'deleted'} local branches: ${plan.deleteLocal.join(', ')}`);
-    if (plan.deleteRemote.length) console.log(`${dryRun ? 'would delete' : 'deleted'} branches on GitHub: ${plan.deleteRemote.join(', ')}`);
+    for (const repo of Object.values(config.repos).filter((r) => fs.existsSync(r))) {
+      const result = await cleanup({ repo, dryRun });
+      if (!result) continue;
+      const { plan } = result;
+      for (const c of plan.removeCopies) console.log(`${dryRun ? 'would remove' : 'removed'} copy ${c.path} (${c.why})`);
+      for (const c of plan.keepCopies) console.log(`keep copy ${c.path}: ${c.why}`);
+      if (plan.deleteLocal.length) console.log(`${dryRun ? 'would delete' : 'deleted'} local branches in ${path.basename(repo)}: ${plan.deleteLocal.join(', ')}`);
+      if (plan.deleteRemote.length) console.log(`${dryRun ? 'would delete' : 'deleted'} branches on GitHub in ${path.basename(repo)}: ${plan.deleteRemote.join(', ')}`);
+    }
     return undefined;
   }
-  if (command === 'run') return runTask(parseTask([sub, ...rest]));
   if (command === 'status') {
-    console.log('queue:', JSON.stringify(readJson(QUEUE, []), null, 2));
-    console.log('locks:', fs.readdirSync(path.join(STATE, 'locks')).join(', ') || 'none');
-    const app = appSettings(STATE);
-    console.log('github:', app ? `${app.slug}[bot] (App ${app.appId}, installation ${app.installationId})` : 'Yoan (no GitHub App in config.json)');
     const entries = readLedger();
-    const period = spendingPeriod(new Date(), config);
-    console.log(`${period.kind} since ${period.start.toLocaleString()}: $${spentSince(entries, period.start).toFixed(2)} of $${period.cap}`);
-    for (const t of readJson(QUEUE, [])) {
-      console.log(`  ${t.issue}: sessions $${taskSpent(entries, t.issue).toFixed(2)} of $${t.budgetUsd ?? config.budgetUsd}`);
+    console.log(fs.existsSync(PAUSED) ? 'paused' : 'running (if the service is loaded: factory service status)');
+    console.log('queue:');
+    for (const t of readQueue()) {
+      const cost = taskCost(entries, t.issue, t.since);
+      console.log(`  ${t.issue} ${t.repo} ${t.stage}${t.round ? ` round ${t.round}` : ''}${t.waitUntil ? ` waits until ${t.waitUntil}` : ''} $${cost.total.toFixed(2)} ${t.pr ?? ''}`);
     }
+    console.log('locks:', activeLocks().join(', ') || 'none');
+    const app = appSettings(STATE);
+    console.log('github:', app ? `${app.slug}[bot]` : 'Yoan (no GitHub App in config.json)');
     const costs = entryCosts(entries);
     console.log('last runs:');
     entries.forEach((r, i) => {
       if (i < entries.length - 10) return;
-      console.log(`  ${r.ended} ${r.issue} ${r.status}${r.minutes == null ? '' : ` ${r.minutes}min`} $${costs[i].toFixed(2)} ${r.pr ?? ''}`);
+      console.log(`  ${r.ended} ${r.issue} ${r.role ?? ''} ${r.status}${r.verdict ? ` ${r.verdict}` : ''}${r.minutes == null ? '' : ` ${r.minutes}min`} $${costs[i].toFixed(2)} ${r.pr ?? ''}`);
     });
     return undefined;
   }
-  console.log('usage: factory queue add <INV-xx> --branch <b> --brief <file> [...] | factory queue run [--now] | factory run <INV-xx> ... | factory status | factory clean [--dry-run] | factory pause [--wait] | factory resume | factory requeue <INV-xx> [--ci | --message <text>] | factory service install|uninstall|status');
+  console.log('usage: factory queue run | factory status | factory pause [--wait] | factory resume | factory requeue <INV-xx> [--message <text>] | factory clean [--dry-run] | factory linear ask|comment|state ... | factory service install|uninstall|status');
   return undefined;
 }
 
