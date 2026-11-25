@@ -24,7 +24,7 @@ import { cleanupSummary, oldLogs, parseWorktrees, planCleanup } from './janitor.
 import {
   blockingDeps, checksVerdict, classify, failedChecks, fillTemplate, findPrUrl, fixMessage, inWindow, isFeatureBranch,
   entryCosts, minutesBetween, nextRunnable, nextWindowStart, nightReport, nightStart, parseLimitReset, parseResult,
-  servicePlist, sessionBudget, sessionDirName, spendingPeriod, spentSince, taskSpent,
+  servicePlist, sessionBudget, sessionDirName, spendingPeriod, spentSince, statusAction, taskSpent,
 } from './lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -679,12 +679,52 @@ async function takeAnswers() {
 }
 
 let lastSync = 0;
+async function comment(issueKey, body) {
+  const issue = (await linear('query($id:String!){issue(id:$id){id}}', { id: issueKey }))?.issue;
+  if (issue) await linear('mutation($id:String!,$b:String!){commentCreate(input:{issueId:$id,body:$b}){success}}', { id: issue.id, b: body });
+}
+
+// One writer for the status of the runner's tasks (INV-50): the queue says where a task is and Linear shows it.
+// A task in the queue is In Progress, or In Review while its PR waits for CI. A "Чака Йоан" whose reason is gone
+// (the task is back in the queue) is closed with a note. A task Yoan moved back to Backlog or Canceled leaves the
+// queue: Ready is the "go" button, and moving it back is "stop". A feature closed while its subtasks still run (the
+// GitHub integration closes an issue named in a merged PR's title) is opened again.
+async function reconcileStatuses() {
+  const queue = readJson(QUEUE, []);
+  for (const task of queue) {
+    const state = (await linear('query($id:String!){issue(id:$id){state{name type}}}', { id: task.issue }))?.issue?.state;
+    if (!state) continue;
+    const { action, want, note } = statusAction(task, state);
+    if (action === 'remove') {
+      updateItem(task.issue, null);
+      ledger({ issue: task.issue, branch: task.branch, base: task.base || 'main', ended: new Date().toISOString(), status: 'stopped', state: state.name });
+      await comment(task.issue, `**Спряно.** Задачата е в ${state.name}, затова runner-ът я извади от опашката. Върни я в Ready, за да продължи.`);
+      log(`linear: ${task.issue} is in ${state.name}, taken out of the queue`);
+    } else if (action === 'set') {
+      await setState(task.issue, want);
+      if (note) {
+        await comment(task.issue, `**Вече не чака теб.** Задачата е пак в опашката на runner-а: ${task.stage === 'ci' ? 'PR-ът чака CI' : 'чака ред или зависимост'}.`);
+        log(`linear: ${task.issue} no longer waits for Yoan, ${want}`);
+      }
+    }
+  }
+  for (const base of new Set(readJson(QUEUE, []).map((t) => t.base).filter(isFeatureBranch))) {
+    const id = base.slice('feature/'.length);
+    const state = (await linear('query($id:String!){issue(id:$id){state{type}}}', { id }))?.issue?.state;
+    if (state?.type !== 'completed') continue;
+    await setState(id, 'In Progress');
+    await comment(id, `**Отворено отново.** Подзадачите още вървят в \`${base}\`. Функционалността е готова, когато PR-ът ѝ към main се слее.`);
+    log(`linear: ${id} opened again, its subtasks still run`);
+  }
+}
+
 async function syncFromLinear() {
   if (Date.now() - lastSync < 5 * 60 * 1000) return;
   lastSync = Date.now();
   try {
     await takeAnswers();
     await takeReady();
+    await reconcileStatuses();
   } catch (error) {
     log(`linear sync: ${error.message.slice(0, 300)}`);
   }
@@ -1061,6 +1101,28 @@ async function main() {
     return log(`requeued ${issue}${item.stage === 'ci' ? ` to wait for CI on ${pr}` : ''}`);
   }
   if (command === 'service') return service(sub);
+  // Claude in an interactive session writes in Linear as the app, not as Yoan (INV-50): Yoan gets a notification and
+  // the history shows who wrote what. ask: a question in three parts that mentions Yoan and moves the task to
+  // "Чака Йоан"; comment: a note; state: a status.
+  if (command === 'linear') {
+    const [issueKey, ...more] = rest;
+    const at = more.indexOf('--body-file');
+    const body = at >= 0 ? fs.readFileSync(more[at + 1], 'utf8').trim() : null;
+    if (!issueKey || !['ask', 'comment', 'state'].includes(sub)) return console.log('usage: factory linear ask|comment <INV-xx> --body-file <file> | factory linear state <INV-xx> <state>');
+    if (sub === 'state') {
+      await setState(issueKey, more.join(' '));
+      return console.log(`${issueKey}: ${more.join(' ')}`);
+    }
+    if (!body) return console.log('--body-file <file> is needed');
+    if (sub === 'ask') {
+      const who = await yoanMention();
+      await setState(issueKey, 'Чака Йоан');
+      await comment(issueKey, `${who ? `${who} ` : ''}${body}`);
+    } else {
+      await comment(issueKey, body);
+    }
+    return console.log(`${issueKey}: ${sub} posted as the app`);
+  }
   if (command === 'clean') {
     const dryRun = sub === '--dry-run' || rest.includes('--dry-run');
     const result = await cleanup({ dryRun });

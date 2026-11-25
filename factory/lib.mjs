@@ -176,7 +176,7 @@ export function sessionBudget({ taskCap, taskSpent: spentOnTask = 0, periodCap, 
 const STATUS_BG = {
   done: 'PR отворен', merged: 'слято', needs_answer: 'въпрос към теб', limit: 'спрян от лимита', error: 'грешка',
   ci_failed: 'червен CI', blocked: 'блокирана', closed: 'PR затворен', 'ci-evals': 'evals в CI', over_budget: 'над тавана',
-  answered: 'отговорено',
+  answered: 'отговорено', stopped: 'спряна от теб',
 };
 
 // The night report for Linear: one line per task, the evals in CI, the total against the cap.
@@ -207,6 +207,19 @@ export function nightReport(entries, since, nightCap) {
   }
   if (byTask.size === 0) lines.push('| - | нищо не е пускано | 0 | 0 | 0.00 | 0.00 | - |');
   return lines.join('\n');
+}
+
+// --- One writer for the status of the runner's tasks (INV-50) ---
+
+// What the runner does with the Linear status of a task in its queue. In the queue means In Progress, or In Review
+// while the PR waits for CI. Backlog or Canceled means Yoan stopped it. A "Чака Йоан" left over from a question that
+// is gone is replaced, with a note. Other statuses (Done, In Review on a fix round) are left as they are.
+export function statusAction(task, state) {
+  const want = task.stage === 'ci' ? 'In Review' : 'In Progress';
+  if (state.type === 'backlog' || state.type === 'canceled') return { action: 'remove' };
+  if (state.name === 'Чака Йоан') return { action: 'set', want, note: true };
+  if (state.name === 'Ready' || (state.name === 'In Progress' && want === 'In Review')) return { action: 'set', want, note: false };
+  return { action: 'none' };
 }
 
 // --- The runner as a launchd service (INV-49) ---
