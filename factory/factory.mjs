@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { appSettings, installationToken, sessionEnv, writeGhConfig } from './github-app.mjs';
 import { linearClient, mention } from './linear.mjs';
 import { answerAfter, planFromReady } from './linear-sync.mjs';
+import { cleanupSummary, oldLogs, parseWorktrees, planCleanup } from './janitor.mjs';
 import {
   blockingDeps, checksVerdict, classify, failedChecks, fillTemplate, findPrUrl, fixMessage, inWindow, isFeatureBranch,
   entryCosts, minutesBetween, nextRunnable, nextWindowStart, nightReport, nightStart, parseLimitReset, parseResult,
@@ -31,7 +32,10 @@ const HOME = os.homedir();
 const STATE = process.env.INVOICELY_HOME || path.join(HOME, '.invoicely');
 const config = {
   repo: path.join(HOME, 'projects/invoicely-agents'),
-  worktrees: path.join(HOME, 'projects/ia-wt'),
+  // New task copies live in the repo's .claude/worktrees, the place `claude -w` uses (INV-48); a task that began in
+  // the old folder keeps its copy there until it ends, because its session resumes by path.
+  worktrees: path.join(HOME, 'projects/invoicely-agents/.claude/worktrees'),
+  legacyWorktrees: path.join(HOME, 'projects/ia-wt'),
   pluginRef: 'origin/main',
   budgetUsd: 15, // API dollars a task's sessions may spend over all their runs; a task's own budgetUsd overrides it
   windowStart: 22,
@@ -78,7 +82,7 @@ async function sleepUntil(when) {
 
 // The plugin loads from its own copy: Claude Code refuses edits to a loaded plugin's files.
 function ensureRuntime() {
-  const runtime = path.join(config.worktrees, 'plugin-runtime');
+  const runtime = path.join(config.legacyWorktrees, 'plugin-runtime');
   if (!fs.existsSync(runtime)) {
     git(config.repo, ['fetch', '-q', 'origin']);
     git(config.repo, ['worktree', 'add', '-q', '--detach', runtime, config.pluginRef]);
@@ -89,10 +93,19 @@ function ensureRuntime() {
   return runtime;
 }
 
+// A task's copy lives as long as the task (INV-48): the queue item and every ledger entry keep its path.
+function taskCopyPath(task) {
+  if (task.worktree) return task.worktree;
+  const legacy = path.join(config.legacyWorktrees, task.branch);
+  return fs.existsSync(legacy) ? legacy : path.join(config.worktrees, task.branch);
+}
+
 // A new task branch starts from its base as it is now: for a subtask, the feature branch with every merged subtask.
-function ensureWorktree(branch, base = 'main') {
-  const wt = path.join(config.worktrees, branch);
+function ensureWorktree(task, base = 'main') {
+  const branch = task.branch;
+  const wt = taskCopyPath(task);
   if (fs.existsSync(wt)) return wt;
+  fs.mkdirSync(path.dirname(wt), { recursive: true });
   git(config.repo, ['fetch', '-q', 'origin']);
   try {
     git(config.repo, ['worktree', 'add', '-q', wt, branch]);
@@ -325,7 +338,8 @@ async function runTask(task, budgetCap) {
     const runtime = ensureRuntime();
     const prBase = task.base || 'main';
     ensureBase(prBase);
-    const wt = ensureWorktree(task.branch, prBase);
+    const wt = ensureWorktree(task, prBase);
+    if (task.worktree !== wt) updateItem(task.issue, { worktree: wt });
     const budget = Math.min(task.budgetUsd ?? config.budgetUsd, budgetCap ?? Infinity);
     const base = ['--plugin-dir', runtime, '--permission-mode', 'acceptEdits', '--output-format', 'json',
       '--max-budget-usd', String(budget), ...(task.addDir ? ['--add-dir', task.addDir] : []), '--allowedTools', ...ALLOWED_TOOLS];
@@ -362,7 +376,7 @@ async function runTask(task, budgetCap) {
     const entry = {
       issue: task.issue, branch: task.branch, base: prBase, session, started: started.toISOString(),
       ended: ended.toISOString(), minutes: minutesBetween(started, ended), status, exitCode: code, costUsd: runCost, sessionCostUsd: result.costUsd,
-      turns: result.turns, pr: findPrUrl(result.text), resetAt: reset ? reset.toString() : null, resumedFrom: task.resumeSession ?? null, actor: identity ? identity.name : 'yoan', log: logFile,
+      turns: result.turns, pr: findPrUrl(result.text), resetAt: reset ? reset.toString() : null, resumedFrom: task.resumeSession ?? null, actor: identity ? identity.name : 'yoan', log: logFile, worktree: wt,
     };
     fs.appendFileSync(LEDGER, `${JSON.stringify(entry)}\n`);
     log(`${task.issue}: ${status}${entry.pr ? ` ${entry.pr}` : ''}`);
@@ -444,7 +458,9 @@ async function reportNight(reason) {
   if (state.nights.includes(since.toISOString())) return;
   const entries = readLedger();
   if (!entries.some((e) => e.ended && Date.parse(e.ended) >= since.getTime())) return;
-  const body = `${nightReport(entries, since, config.nightBudgetUsd)}\n\n${reason}`;
+  const cleaned = readJson(path.join(STATE, 'cleanup.json'), {}).summary;
+  const fresh = cleaned && cleaned.day === new Date().toLocaleDateString('sv-SE') ? `\n\n${cleaned.text}` : '';
+  const body = `${nightReport(entries, since, config.nightBudgetUsd)}\n\n${reason}${fresh}`;
   // A report that did not reach Linear (no network after the Mac wakes) is tried again on the next round, up to
   // 12 times (about an hour); before INV-47 it was marked as sent and never reached Linear.
   const key = since.toISOString();
@@ -502,6 +518,7 @@ async function processCi() {
       updateItem(item.issue, null);
       log(`${item.issue}: ${entry.status} ${item.pr}`);
       if (entry.status === 'merged') await reportToLinear(entry, '');
+      await cleanup({ only: item.branch }); // the task's copy and branch go with it (INV-48)
       continue;
     }
     const rounds = item.fixRounds ?? 0;
@@ -656,6 +673,132 @@ async function syncFromLinear() {
   }
 }
 
+// --- Clean-up (INV-48): copies and branches of finished tasks go; see janitor.mjs for the rules ---
+
+function repoSlug() {
+  return /github\.com[:/](.+?)(?:\.git)?$/.exec(git(config.repo, ['remote', 'get-url', 'origin']))?.[1];
+}
+
+async function cleanupFacts({ fetch }) {
+  if (fetch) git(config.repo, ['fetch', '-q', '--prune', 'origin']);
+  const managed = [config.worktrees, config.legacyWorktrees];
+  const copies = parseWorktrees(git(config.repo, ['worktree', 'list', '--porcelain']))
+    .filter((w) => managed.includes(path.dirname(w.path)))
+    .map((w) => {
+      let dirty = true;
+      try {
+        dirty = execFileSync('git', ['status', '--porcelain'], { cwd: w.path, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' }, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim() !== '';
+      } catch {
+        // a copy git cannot read is treated as holding work
+      }
+      return { ...w, dirty };
+    });
+  const refs = (prefix) => git(config.repo, ['for-each-ref', prefix, '--format=%(refname:short) %(objectname)'])
+    .split('\n').filter(Boolean).map((line) => { const [name, head] = line.split(' '); return { name, head }; });
+  const remoteBranches = refs('refs/remotes/origin').filter((b) => b.name.startsWith('origin/') && b.name !== 'origin/HEAD')
+    .map((b) => ({ name: b.name.slice('origin/'.length), head: b.head }));
+  const prs = await gh(['pr', 'list', '--state', 'all', '--limit', '500', '--json', 'number,headRefName,headRefOid,state'], { json: true });
+  // The plugin's copy, the copy this runner runs from, and the main checkout are never touched.
+  const protectedPaths = [path.join(config.legacyWorktrees, 'plugin-runtime'), path.dirname(HERE), config.repo];
+  return { copies, prs, localBranches: refs('refs/heads'), remoteBranches, protectedPaths, queue: readJson(QUEUE, []) };
+}
+
+async function cleanup({ only = null, dryRun = false } = {}) {
+  let facts;
+  try {
+    facts = await cleanupFacts({ fetch: !dryRun });
+  } catch (error) {
+    log(`cleanup: ${error.message.split('\n')[0]}`);
+    return null;
+  }
+  if (only) {
+    facts.copies = facts.copies.filter((c) => c.branch === only);
+    facts.localBranches = facts.localBranches.filter((b) => b.name === only);
+    facts.remoteBranches = facts.remoteBranches.filter((b) => b.name === only);
+  }
+  const plan = planCleanup(facts);
+  const done = { copies: 0, local: 0, remote: 0, logs: 0 };
+  if (dryRun) return { plan, done };
+  const tried = (what, fn) => {
+    try {
+      fn();
+      return true;
+    } catch (error) {
+      log(`cleanup: ${what}: ${error.message.split('\n')[0]}`);
+      return false;
+    }
+  };
+  for (const c of plan.removeCopies) {
+    if (tried(c.path, () => git(config.repo, ['worktree', 'remove', c.path]))) { done.copies += 1; log(`cleanup: removed ${c.path} (${c.why})`); }
+  }
+  for (const name of plan.deleteLocal) if (tried(name, () => git(config.repo, ['branch', '-D', name]))) done.local += 1;
+  const slug = plan.deleteRemote.length ? repoSlug() : null;
+  for (const name of plan.deleteRemote) {
+    try {
+      await gh(['api', '-X', 'DELETE', `repos/${slug}/git/refs/heads/${name}`], { asBot: true });
+      done.remote += 1;
+    } catch (error) {
+      log(`cleanup: origin/${name}: ${error.message.split('\n')[0]}`);
+    }
+  }
+  if (!only) {
+    tried('worktree prune', () => git(config.repo, ['worktree', 'prune']));
+    const logsDir = path.join(STATE, 'logs');
+    const files = fs.readdirSync(logsDir).map((name) => ({ name, mtimeMs: fs.statSync(path.join(logsDir, name)).mtimeMs }));
+    for (const name of oldLogs(files, new Date())) if (tried(name, () => fs.rmSync(path.join(logsDir, name)))) done.logs += 1;
+    // The copy of a brief goes when its task is merged or closed and no longer queued; Linear keeps the brief.
+    const last = new Map();
+    for (const e of readLedger()) if (e.issue && e.status !== 'ci-evals') last.set(e.issue, e.status);
+    const briefs = path.join(STATE, 'briefs');
+    for (const file of fs.existsSync(briefs) ? fs.readdirSync(briefs) : []) {
+      const issue = file.replace(/\.md$/, '');
+      if (!facts.queue.some((t) => t.issue === issue) && ['merged', 'closed'].includes(last.get(issue))) tried(file, () => fs.rmSync(path.join(briefs, file)));
+    }
+  }
+  for (const kept of plan.report) await reportCopyKept(kept);
+  if (done.copies + done.local + done.remote + done.logs > 0) log(`cleanup: ${cleanupSummary(plan, done)}`);
+  return { plan, done };
+}
+
+// A copy whose PR is over but that holds unsaved work stays; Yoan is told once, in the task.
+async function reportCopyKept(kept) {
+  const stateFile = path.join(STATE, 'cleanup.json');
+  const state = readJson(stateFile, {});
+  if ((state.told ?? []).includes(kept.path)) return;
+  const issue = /^inv-(\d+)/i.exec(kept.branch)?.[1];
+  log(`cleanup: kept ${kept.path}: ${kept.why}`);
+  if (issue) {
+    try {
+      const found = (await linear('query($id:String!){issue(id:$id){id}}', { id: `INV-${issue}` }))?.issue;
+      if (found) {
+        await linear('mutation($id:String!,$body:String!){commentCreate(input:{issueId:$id,body:$body}){success}}', {
+          id: found.id,
+          body: `**Копието остава на диска:** \`${kept.path}\`. ${kept.why.replace(/^PR/, 'PR-ът')}. Нищо не се губи; копието се маха, щом работата в него бъде записана или вече не трябва.`,
+        });
+      }
+    } catch (error) {
+      log(`linear: ${error.message}`);
+    }
+  }
+  state.told = [...(state.told ?? []).slice(-50), kept.path];
+  fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+}
+
+// Once a day, after the night window, and never while a session runs.
+async function maybeCleanup() {
+  const now = new Date();
+  if (inWindow(now, config.windowStart, config.windowEnd)) return;
+  const stateFile = path.join(STATE, 'cleanup.json');
+  const today = now.toLocaleDateString('sv-SE');
+  if (readJson(stateFile, {}).lastRun === today) return;
+  if (fs.readdirSync(path.join(STATE, 'locks')).length > 0) return;
+  const result = await cleanup();
+  const state = readJson(stateFile, {});
+  state.lastRun = today;
+  if (result) state.summary = { day: today, text: cleanupSummary(result.plan, result.done) };
+  fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+}
+
 // The same line every 5 minutes says nothing new: a state is logged once.
 const loggedOnce = new Set();
 function logOnce(key, message) {
@@ -682,6 +825,7 @@ async function runQueue(now) {
   for (;;) {
     await syncFromLinear();
     await processCi();
+    await maybeCleanup();
     let queue = readJson(QUEUE, []);
     if (queue.length === 0) {
       await reportNight('Опашката е празна.');
@@ -759,6 +903,17 @@ async function main() {
     return log(`queued ${rest[0]} (${queue.length} in queue)`);
   }
   if (command === 'queue' && sub === 'run') return runQueue(rest.includes('--now'));
+  if (command === 'clean') {
+    const dryRun = sub === '--dry-run' || rest.includes('--dry-run');
+    const result = await cleanup({ dryRun });
+    if (!result) return undefined;
+    const { plan } = result;
+    for (const c of plan.removeCopies) console.log(`${dryRun ? 'would remove' : 'removed'} copy ${c.path} (${c.why})`);
+    for (const c of plan.keepCopies) console.log(`keep copy ${c.path}: ${c.why}`);
+    if (plan.deleteLocal.length) console.log(`${dryRun ? 'would delete' : 'deleted'} local branches: ${plan.deleteLocal.join(', ')}`);
+    if (plan.deleteRemote.length) console.log(`${dryRun ? 'would delete' : 'deleted'} branches on GitHub: ${plan.deleteRemote.join(', ')}`);
+    return undefined;
+  }
   if (command === 'run') return runTask(parseTask([sub, ...rest]));
   if (command === 'status') {
     console.log('queue:', JSON.stringify(readJson(QUEUE, []), null, 2));
@@ -779,7 +934,7 @@ async function main() {
     });
     return undefined;
   }
-  console.log('usage: factory queue add <INV-xx> --branch <b> --brief <file> [...] | factory queue run [--now] | factory run <INV-xx> ... | factory status');
+  console.log('usage: factory queue add <INV-xx> --branch <b> --brief <file> [...] | factory queue run [--now] | factory run <INV-xx> ... | factory status | factory clean [--dry-run]');
   return undefined;
 }
 

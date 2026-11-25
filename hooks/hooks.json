@@ -1,5 +1,5 @@
 {
-  "description": "Invoicely guards: each agent writes only the paths in policies/role-guard.yaml, through Write and Edit or through Bash; nobody pushes to main, force pushes, skips hooks or merges.",
+  "description": "Invoicely guards: each agent writes only the paths in policies/role-guard.yaml, through Write and Edit or through Bash; nobody pushes to main, force pushes, skips hooks or merges; nobody moves or deletes a task copy by hand.",
   "hooks": {
     "PreToolUse": [
       {
@@ -18,6 +18,11 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/main-guard.mjs\"",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/copy-guard.mjs\"",
             "timeout": 10
           }
         ]
