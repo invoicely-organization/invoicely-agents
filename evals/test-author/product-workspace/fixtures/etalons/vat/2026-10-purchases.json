@@ -1,0 +1,21 @@
+{
+  "etalon": "Purchase cells of the VAT return, October 2026",
+  "preparedBy": "Konstantin, accountant",
+  "company": { "name": "Примерна Търговия ЕООД", "eik": "204567893", "vatNumber": "BG204567893" },
+  "period": "2026-10",
+  "lines": [
+    {
+      "documentNo": "0000004512", "date": "2026-10-03", "supplier": "Офис Снаб ООД", "supplierVat": "BG131234568",
+      "base": 40000, "vat": 8000, "treatment": "no-credit", "note": "representation expenses, no right to tax credit"
+    },
+    {
+      "documentNo": "0000017830", "date": "2026-10-09", "supplier": "Транс Логистик ЕАД", "supplierVat": "BG175074752",
+      "base": 125050, "vat": 25010, "treatment": "full-credit"
+    },
+    {
+      "documentNo": "0000000291", "date": "2026-10-21", "supplier": "Строй Материали ЕООД", "supplierVat": "BG203987652",
+      "base": 7999, "vat": 1600, "treatment": "full-credit"
+    }
+  ],
+  "expected": { "cell30": 48000, "cell31": 133049, "cell41": 26610 }
+}

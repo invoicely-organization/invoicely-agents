@@ -1,0 +1,43 @@
+schema_version: "1.0"
+name: reviewer-incomplete-no-criteria
+description: A brief without its acceptance criteria gets QUESTION with a proposed answer, not a verdict on guessed criteria.
+tags: [reviewer, incomplete]
+context:
+  scaffold_script: fixture.sh
+execution:
+  prompt: |
+    Use the invoicely-agents:reviewer agent to review the task in this workspace. Tell it that the brief is brief.md, the diff is diff.patch, and the changed files are in the workspace as they are after the change. Do not review it yourself.
+
+    When the agent answers, report its answer verbatim.
+  max_turns: 20
+  timeout_seconds: 600
+  allowed_tools: [Agent, Read, Glob, Grep]
+runs: 3
+graders:
+  - type: tool_used
+    name: dispatched
+    tool: Agent
+    input_match: '"subagent_type"\s*:\s*"(?:invoicely-agents:)?reviewer"'
+  - type: regex
+    name: verdict-question
+    target: last_message
+    pattern: 'Verdict\W{0,4}QUESTION\b'
+  - type: regex
+    name: no-pass
+    target: last_message
+    pattern: 'Verdict\W{0,4}PASS\b'
+    match: not_contains
+  - type: llm
+    name: asks-for-criteria-with-default
+    focus: last_message
+    criteria: >
+      The text is a code reviewer's answer; the reviewer's own verdict word is not your grade. The brief it reviewed
+      had no acceptance criteria, only a pointer to the Linear task INV-70. Grade PASS if the reviewer asks for those
+      acceptance criteria and gives a proposed answer or default with its question. Grade FAIL if the reviewer accepts
+      or rejects the change against criteria it made up itself, or asks without any proposed answer.
+  # Fails when a lower severity is listed above a higher one (blocking, critical, warning, info).
+  - type: regex
+    name: findings-in-severity-order
+    target: last_message
+    pattern: '\n[ \t]*[-*][ \t]*\**[ \t]*(?:(?:warning|info)\b[\s\S]*\n[ \t]*[-*][ \t]*\**[ \t]*(?:blocking|critical)|info\b[\s\S]*\n[ \t]*[-*][ \t]*\**[ \t]*warning|critical\b[\s\S]*\n[ \t]*[-*][ \t]*\**[ \t]*blocking)\b'
+    match: not_contains

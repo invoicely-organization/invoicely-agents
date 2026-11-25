@@ -1,0 +1,27 @@
+diff --git a/packages/domain/vat/vat-cells.ts b/packages/domain/vat/vat-cells.ts
+--- a/packages/domain/vat/vat-cells.ts
++++ b/packages/domain/vat/vat-cells.ts
+@@ -7,6 +7,9 @@ export function cellsFor(line: VatLine): VatCells {
+     return { base: 19 };
+   }
+   const otherEuState = line.clientCountry !== 'BG' && isEuCountry(line.clientCountry);
++  if (line.kind === 'goods' && otherEuState && line.clientVatNumber !== null) {
++    return { base: 15 };
++  }
+   if (line.kind === 'goods' && !isEuCountry(line.clientCountry)) {
+     return { base: 14 };
+   }
+diff --git a/packages/domain/vat/vat-cells.test.ts b/packages/domain/vat/vat-cells.test.ts
+--- a/packages/domain/vat/vat-cells.test.ts
++++ b/packages/domain/vat/vat-cells.test.ts
+@@ -16,6 +16,10 @@ describe('cellsFor', () => {
+     expect(cellsFor(line({}))).toEqual({ base: 11, tax: 21 });
+   });
+
++  it('puts goods to a business client in another EU state in cell 15', () => {
++    expect(cellsFor(line({ kind: 'goods', clientCountry: 'DE', clientVatNumber: 'DE811569869' }))).toEqual({ base: 15 });
++  });
++
+   it('puts goods exported outside the EU in cell 14', () => {
+     expect(cellsFor(line({ kind: 'goods', clientCountry: 'US', clientVatNumber: null }))).toEqual({ base: 14 });
+   });

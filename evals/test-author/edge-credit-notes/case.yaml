@@ -1,0 +1,56 @@
+schema_version: "1.0"
+name: test-author-edge-credit-notes
+description: Credit notes with negative amounts and an empty period get tests whose expected values come from the etalon and the criteria, not from summing the lines in the test.
+tags: [test-author, edge]
+context:
+  scaffold_script: fixture.sh
+execution:
+  prompt: |
+    Use the invoicely-agents:test-author agent on the brief in brief.md and let it work in this repo. Do not write any files yourself.
+
+    When the agent is done, report what it wrote and repeat any question it asks word for word.
+  max_turns: 30
+  timeout_seconds: 900
+  allowed_tools: [Agent, Read, Glob, Grep, Write, Edit]
+runs: 3
+graders:
+  - type: tool_used
+    name: dispatched
+    tool: Agent
+    input_match: '"subagent_type"\s*:\s*"(?:invoicely-agents:)?test-author"'
+  - type: tool_used
+    name: etalon-read
+    tool: Read
+    input_match: '2026-11-purchases\.json'
+    min: 1
+  - type: file_exists
+    name: test-file-created
+    path: packages/domain/src/vat/purchase-cells.credit-notes.test.ts
+  - type: regex
+    name: credit-note-reduces-cell-30
+    target: {source: file, path: packages/domain/src/vat/purchase-cells.credit-notes.test.ts}
+    pattern: '\b36000\b|-\s?12000\b'
+  - type: regex
+    name: credit-note-not-added
+    target: {source: file, path: packages/domain/src/vat/purchase-cells.credit-notes.test.ts}
+    pattern: '\b60000\b'
+    match: not_contains
+  - type: regex
+    name: implementation-untouched
+    target: {source: file, path: packages/domain/src/vat/purchase-cells.ts}
+    pattern: "throw new Error\\('not implemented'\\);"
+  - type: llm
+    name: boundaries-from-the-etalon
+    focus: {source: file, path: packages/domain/src/vat/purchase-cells.credit-notes.test.ts}
+    criteria: >
+      The brief has four criteria: (1) a credit note for a purchase without tax credit reduces cell 30 by its base
+      plus VAT (etalon: invoice 40000 + 8000 and credit note -10000 - 2000 give cell 30 = 36000, the credit note alone
+      gives -12000); (2) a credit note for a purchase with full tax credit reduces cell 31 by its base and cell 41 by
+      its VAT (etalon: 250000/50000 and -2550/-510 give 247450 and 49490, the credit note alone gives -2550 and -510);
+      (3) a period without purchases gives 0 in cells 30, 31 and 41; (4) the November 2026 etalon gives cell 30 = 36000,
+      cell 31 = 247450, cell 41 = 49490. PASS if this test file has at least one test for each of the four criteria,
+      each named after its criterion (by number or by its words), the credit note tests use negative amounts and
+      expect the cells to go down, criterion 3 passes an empty list and expects 0 in all three cells, and every
+      expected value is a literal matching the numbers above or is read from the etalon's "expected" block.
+      FAIL if a criterion has no test, if a credit note is expected to increase a cell, or if an expected value is
+      computed in the test by summing or filtering the input lines.
