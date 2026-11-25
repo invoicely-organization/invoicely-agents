@@ -6,6 +6,8 @@ The task, as Yoan wrote it in Linear (Какво: what he wants; Как пров
 {TASK}
 </task>
 
+{DOCUMENTS}
+
 You work in {WT}, a git worktree of the {REPO} repo on the branch {BRANCH}. test-author wrote the task's tests in a separate session and the runner committed them: {TESTS}. They are locked: the role guard refuses your writes to test files, and the runner checks your whole diff when you finish.
 
 Write the code until the tests pass, following your agent instructions and the repo's CLAUDE.md. Run the tests and the repo's checks after your last edit.

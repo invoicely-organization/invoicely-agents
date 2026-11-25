@@ -28,6 +28,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mergeInProgress, policyViolations, unmergedFiles } from './git-check.mjs';
 import { appSettings, installationToken, sessionEnv, writeGhConfig } from './github-app.mjs';
+import { documentsBlock, linearDocument, linearGlossary, prDocumentsSection, sessionGate, taskDocuments } from './documents.mjs';
 import { cleanupSummary, oldLogs, parseWorktrees, planCleanup } from './janitor.mjs';
 import { linearClient, mention } from './linear.mjs';
 import { answerAfter, planFromReady } from './linear-sync.mjs';
@@ -65,6 +66,7 @@ const MAX_DISPUTES = 2; // times a test may go back to test-author before Yoan d
 const MAX_LIMIT_WAITS = 8; // limit resets waited for in a row before Yoan is told ("Credit balance is too low" may not reset)
 const MAX_REVIEW_ERRORS = 5; // rounds in a row in which GitHub or git failed on a PR before Yoan is told
 const REVIEW_TIMEOUT_MINUTES = 150;
+const PR_BODY_LIMIT = 65000; // GitHub refuses a PR description of more than about 65 536 characters
 
 // The runner runs from the main checkout of invoicely-agents, which stays on main and which nobody works in.
 const RUNS_FROM_REPO = path.resolve(path.dirname(HERE)) === path.resolve(AGENTS_REPO);
@@ -320,6 +322,21 @@ function testsLine(task) {
   return `in commit ${task.testsCommit.slice(0, 10)}: ${(task.testFiles ?? []).join(', ') || 'see git show --stat'}`;
 }
 
+// The documents the agents got, kept next to the brief for the PR description.
+const documentsFile = (task) => path.join(STATE, 'briefs', `${task.issue}.documents.json`);
+
+// The task's Linear documents (INV-71): the linked ones, and the glossary for the invoicely repo.
+async function readTaskDocuments(task, text) {
+  return taskDocuments({
+    text, repo: task.repo,
+    getDocument: (slugId) => linearDocument(linear, slugId),
+    findGlossary: () => linearGlossary(linear).catch((error) => {
+      log(`${task.issue}: the glossary could not be read: ${error.message.slice(0, 200)}`);
+      return null;
+    }),
+  });
+}
+
 // One session of a role on the task's copy: a new one with the role's prompt, or the same session resumed with a
 // message. Returns what the session left: its status, its report and what it cost.
 async function runSession(task, role, wt, budget) {
@@ -333,10 +350,25 @@ async function runSession(task, role, wt, budget) {
   if (id) {
     args = sessionArgs({ ...base, prompt: task.message || CONTINUE, resume: id });
   } else {
+    // The Linear documents the task links, read now for their last version (INV-71). A document that cannot be read
+    // stops the task with a question, before any session starts.
+    const text = fs.readFileSync(task.brief, 'utf8').trim();
+    const { docs, unreadable } = await readTaskDocuments(task, text);
+    const gate = sessionGate({ text, unreadable });
+    if (gate.action === 'ask') {
+      await askYoan(task, {
+        kind: 'documents', role,
+        what: gate.what,
+        todo: 'оправи задачата (критериите или линковете към документите) или достъпа до документа и пиши тук "опитай пак". Предложение: махни линка, ако документът вече не трябва.',
+        ifNot: 'задачата стои, сесия не се пуска.',
+      });
+      return { status: 'asked', text: '', report: '', session: null };
+    }
+    fs.writeFileSync(documentsFile(task), JSON.stringify(docs));
     // The session gets its id up front and the queue remembers it, so a run cut off by a restart resumes it.
     id = crypto.randomUUID();
     const prompt = fillTemplate(fs.readFileSync(path.join(HERE, 'prompts', `${role}.md`), 'utf8'), {
-      ISSUE: task.issue, TASK: fs.readFileSync(task.brief, 'utf8').trim(), WT: wt, REPO: task.repo, BRANCH: task.branch, TESTS: testsLine(task),
+      ISSUE: task.issue, TASK: text, DOCUMENTS: documentsBlock(docs), WT: wt, REPO: task.repo, BRANCH: task.branch, TESTS: testsLine(task),
     });
     const message = task.message && task.message !== CONTINUE ? task.message : '';
     args = sessionArgs({ ...base, prompt: message ? `${prompt}\n\n${message}` : prompt, sessionId: id });
@@ -364,6 +396,7 @@ async function runSession(task, role, wt, budget) {
 
 // Limit, error and question are the same for both roles. Returns true when the step ends here.
 async function settleSession(task, role, r) {
+  if (r.status === 'asked') return true; // no session started: runSession asked Yoan already
   if (r.status === 'limit') {
     const waits = (task.limitWaits ?? 0) + 1;
     if (waits > MAX_LIMIT_WAITS) {
@@ -518,12 +551,17 @@ async function existingPr(task) {
 // The PR's description is the task itself (the reviewer's brief) and the implementer's summary.
 async function openPr(task, report) {
   const file = path.join(os.tmpdir(), `invoicely-pr-${task.issue}.md`);
-  const body = [
-    '## Задачата', '', fs.readFileSync(task.brief, 'utf8').trim(), '',
+  const text = fs.readFileSync(task.brief, 'utf8').trim();
+  const head = [
+    '## Задачата', '', text, '',
     '## Какво е направено', '', report || '(няма резюме)', '',
     `## Тестове (test-author)`, '', testsLine(task), '',
-    `Linear: ${task.issue}`,
   ].join('\n');
+  const tail = `Linear: ${task.issue}`;
+  // The documents the agents got, for the reviewer in CI (INV-71); within GitHub's limit for the whole description.
+  const docs = readJson(documentsFile(task), null) ?? (await readTaskDocuments(task, text)).docs;
+  const section = prDocumentsSection(docs, PR_BODY_LIMIT - head.length - tail.length - 4);
+  const body = [head, ...(section ? [section, ''] : []), tail].join('\n');
   fs.writeFileSync(file, body);
   try {
     const slug = repoSlug(repoDir(task));
@@ -791,6 +829,20 @@ async function askYoan(task, { kind, role, what, todo, ifNot, details = '' }) {
   await comment(task.issue, body);
 }
 
+// A task without criteria never entered the queue, so the ledger keeps no step for it: Yoan's fix is to add the
+// criteria and move it back to Ready, where it starts as a new task.
+async function askNoCriteria(issue, what) {
+  ledger({ issue, status: 'needs_answer', kind: 'no_criteria' });
+  log(`${issue}: no acceptance criteria; waits for Yoan`);
+  const who = await yoanMention();
+  try {
+    await setState(issue, 'Чака Йоан');
+  } catch (error) {
+    log(`linear: ${error.message.slice(0, 300)}`);
+  }
+  await comment(issue, `${who ? `${who} ` : ''}**Чака:** ${what}\n\n**Какво да направиш:** добави раздел "Как проверявам" с поне една проверка и върни задачата в Ready.\n\n**Ако не отговориш:** задачата стои, сесия не се пуска.`);
+}
+
 // A new start never reuses a branch or a copy of an earlier run (a closed PR, a task started over): -2, -3, ...
 function freeBranch(task) {
   const repo = config.repos[task.repo];
@@ -822,6 +874,12 @@ async function takeReady() {
       writeQueue([...readQueue(), { ...last.task, ...(['tests', 'tests-fix', 'code', 'fix'].includes(last.task.stage) ? { message: last.task.message ?? CONTINUE } : {}) }]);
       await setState(task.issue, last.task.stage === 'review' ? 'In Review' : 'In Progress');
       log(`linear: ${task.issue} goes on at ${last.task.stage}`);
+      continue;
+    }
+    // No acceptance criteria, no session (INV-71): the task goes to Yoan and starts over when he puts it back in Ready.
+    const gate = sessionGate({ text });
+    if (gate.action === 'ask') {
+      await askNoCriteria(task.issue, gate.what);
       continue;
     }
     const brief = path.join(STATE, 'briefs', `${task.issue}.md`);
