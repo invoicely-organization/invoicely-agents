@@ -258,6 +258,10 @@ export function summaryBody({ pr, report, reviews, cost, minutes }) {
   const reviewLines = caught.length === 0
     ? ['Ревюто мина от първия път, без забележки.']
     : caught.flatMap((r) => [`Кръг ${r.round}: ${r.verdict}`, ...r.findings.slice(0, 5).map((f) => `  ${f}`)]);
+  // From 60 minutes on, the time is shown in hours and minutes, without a zero part (INV-69).
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  const time = hours === 0 ? `${minutes} мин.` : rest === 0 ? `${hours} ч.` : `${hours} ч ${rest} мин.`;
   return [
     `**Готово и слято.** PR: ${pr}`,
     '',
@@ -267,7 +271,7 @@ export function summaryBody({ pr, report, reviews, cost, minutes }) {
     '**Какво хвана ревюто**',
     ...reviewLines,
     '',
-    `**Цена:** ${usd(cost.total)} (сесии ${usd(cost.sessions)}, ревю ${usd(cost.reviews)}), по API цена; на Max е дял от лимита.${minutes ? ` Време: ${minutes} мин.` : ''}`,
+    `**Цена:** ${usd(cost.total)} (сесии ${usd(cost.sessions)}, ревю ${usd(cost.reviews)}), по API цена; на Max е дял от лимита.${minutes ? ` Време: ${time}` : ''}`,
   ].join('\n');
 }
 
