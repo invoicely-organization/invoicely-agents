@@ -1,0 +1,25 @@
+{
+  "etalon": "Purchase cells of the VAT return with credit notes, November 2026",
+  "preparedBy": "Konstantin, accountant",
+  "company": { "name": "Примерна Търговия ЕООД", "eik": "204567893", "vatNumber": "BG204567893" },
+  "period": "2026-11",
+  "lines": [
+    {
+      "documentNo": "0000004588", "documentType": "invoice", "date": "2026-11-04", "supplier": "Офис Снаб ООД", "supplierVat": "BG131234568",
+      "base": 40000, "vat": 8000, "treatment": "no-credit", "note": "representation expenses, no right to tax credit"
+    },
+    {
+      "documentNo": "0000004601", "documentType": "credit-note", "relatesTo": "0000004588", "date": "2026-11-12", "supplier": "Офис Снаб ООД", "supplierVat": "BG131234568",
+      "base": -10000, "vat": -2000, "treatment": "no-credit"
+    },
+    {
+      "documentNo": "0000018012", "documentType": "invoice", "date": "2026-11-06", "supplier": "Транс Логистик ЕАД", "supplierVat": "BG175074752",
+      "base": 250000, "vat": 50000, "treatment": "full-credit"
+    },
+    {
+      "documentNo": "0000018090", "documentType": "credit-note", "relatesTo": "0000018012", "date": "2026-11-20", "supplier": "Транс Логистик ЕАД", "supplierVat": "BG175074752",
+      "base": -2550, "vat": -510, "treatment": "full-credit"
+    }
+  ],
+  "expected": { "cell30": 36000, "cell31": 247450, "cell41": 49490 }
+}
