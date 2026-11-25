@@ -70,7 +70,8 @@ for (const [key, value] of [['pattern', tool === 'Glob' ? ti.pattern : null], ['
 }
 
 if (tool === 'Bash' && typeof ti.command === 'string') {
-  const command = expand(ti.command);
+  // The text of a commit message, a PR title or body is not a path: "Read / Grep" in a title must pass.
+  const command = expand(ti.command.replace(/(^|\s)(-m|--message|--title|--body)(\s+|=)("[^"]*"|'[^']*')/g, '$1$2 MESSAGE'));
   if (/\bsecurity\s+(find|dump|export)-/.test(command)) deny('reading the Keychain');
   for (const s of SECRET) if (fold(command).includes(s)) deny(`a command that touches ${s}`);
   // A path put together in code ($HOME + "/.invoicely/.env") still names its part under home.

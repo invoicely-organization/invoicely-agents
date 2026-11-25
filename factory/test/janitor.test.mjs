@@ -34,6 +34,7 @@ test('a copy whose PR is over but that holds unsaved work stays and is reported'
   const dirty = [{ path: '/p/x', branch: 'inv-32-test-author', head: 'd4681cf', dirty: true }];
   const ahead = [{ path: '/p/y', branch: 'inv-32-test-author', head: 'ffff000', dirty: false }];
   assert.match(planCleanup({ copies: dirty, prs }).report[0].why, /uncommitted changes/);
+  assert.equal(planCleanup({ copies: dirty, prs }).report[0].bg, 'PR #21 е слят, но в копието има незаписани промени');
   assert.match(planCleanup({ copies: ahead, prs }).report[0].why, /commits that are not in it/);
   assert.equal(planCleanup({ copies: ahead, prs }).removeCopies.length, 0);
 });
@@ -85,6 +86,7 @@ test('a copy with no PR is kept, and reported once it has waited a week', () => 
   const old = planCleanup({ copies: [{ path: '/p/b', branch: 'inv-71-y', head: '2', dirty: false, ageDays: 9.5 }] });
   assert.deepEqual(young.report, []);
   assert.equal(old.report[0].why, 'no PR and no task for 9 days');
+  assert.equal(old.report[0].bg, 'няма PR и задача от 9 дни');
   assert.equal(old.removeCopies.length, 0);
 });
 

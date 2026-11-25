@@ -52,6 +52,9 @@ test('case does not help on the Mac', { skip: process.platform !== 'darwin' }, (
 test('naming .env in a message passes; reading a real one does not', () => {
   assert.equal(call('Bash', { command: 'git commit -m "INV-12: read the config from .env"' }).denied, false);
   assert.equal(call('Bash', { command: 'git config core.sshCommand' }).denied, false);
+  assert.equal(call('Bash', { command: 'git commit -m "INV-51: guard Read / Grep in ~ and ~/.ssh"' }).denied, false);
+  assert.equal(call('Bash', { command: "gh pr create --title 'INV-51: /' --body 'keys in ~/.invoicely/.env stay out'" }).denied, false);
+  assert.equal(call('Bash', { command: 'git commit -m "ok" && cat ~/.ssh/id_rsa' }).denied, true);
   writeFileSync(path.join(work, '.env'), 'KEY=fake\n');
   assert.equal(call('Bash', { command: 'cat .env' }).denied, true);
 });

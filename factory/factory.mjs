@@ -374,6 +374,8 @@ function runClaude(args, cwd, logFile, identity) {
     if (identity) env = sessionEnv(env, identity);
     // A headless session ends with its last turn: an agent left running in the background would be lost with it.
     env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = '1';
+    // Marks the agent's session: the runner's own CLI refuses to run inside it (see main).
+    env.INVOICELY_AGENT_SESSION = '1';
     const child = spawn('claude', args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     const out = fs.createWriteStream(logFile, { flags: 'a' });
@@ -824,11 +826,13 @@ async function cleanupFacts({ fetch }) {
       } catch {
         // a copy git cannot read is treated as holding work
       }
+      // Age since the copy was made, not since its last commit: a new copy's last commit is its base's.
       let ageDays = 0;
       try {
-        ageDays = (Date.now() / 1000 - Number(git(w.path, ['log', '-1', '--format=%ct']))) / 86400;
+        const st = fs.statSync(w.path);
+        ageDays = (Date.now() - (st.birthtimeMs || st.ctimeMs)) / 86400000;
       } catch {
-        // no commit: treated as new
+        // gone meanwhile: treated as new
       }
       return { ...w, dirty, ageDays };
     });
@@ -847,7 +851,7 @@ async function cleanup({ only = null, dryRun = false } = {}) {
   try {
     facts = await cleanupFacts({ fetch: !dryRun });
   } catch (error) {
-    log(`cleanup: ${error.message.split('\n')[0]}`);
+    logOnce(`cleanup:${error.message.split('\n')[0]}`, `cleanup: ${error.message.split('\n')[0]}`);
     return null;
   }
   if (only) {
@@ -912,7 +916,7 @@ async function reportCopyKept(kept) {
       if (found) {
         await linear('mutation($id:String!,$body:String!){commentCreate(input:{issueId:$id,body:$body}){success}}', {
           id: found.id,
-          body: `**Копието остава на диска:** \`${kept.path}\`. ${kept.why.replace(/^PR/, 'PR-ът')}. Нищо не се губи; копието се маха, щом работата в него бъде записана или вече не трябва.`,
+          body: `**Копието остава на диска:** \`${kept.path}\`. ${kept.bg ?? kept.why}. Нищо не се губи; копието се маха, щом работата в него бъде записана или вече не трябва.`,
         });
       }
     } catch (error) {
@@ -1138,6 +1142,12 @@ function service(sub) {
 }
 
 async function main() {
+  // An agent must not drive the runner (its queue, Linear as the app, the service), for example through
+  // `node hooks/../factory/factory.mjs`: the runner marks every agent session and refuses to run inside one.
+  if (process.env.INVOICELY_AGENT_SESSION === '1') {
+    process.stderr.write('factory: not available inside an agent session\n');
+    process.exit(1);
+  }
   const [command, sub, ...rest] = process.argv.slice(2);
   if (command === 'queue' && sub === 'add') {
     const queue = readJson(QUEUE, []);

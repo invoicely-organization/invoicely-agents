@@ -18,7 +18,7 @@ const over = (pr) => pr && (pr.state === 'MERGED' || pr.state === 'CLOSED');
 
 // copies: [{ path, branch, head, dirty }]; branch is null for a detached copy.
 // prs: [{ number, headRefName, headRefOid, baseRefName, state }] from gh pr list --state all.
-// copies may carry ageDays: days since their last commit.
+// copies may carry ageDays: days since the copy was created.
 // queue: the runner's queue; protectedPaths: copies the runner itself needs (the plugin's copy, its own copy).
 // localBranches, remoteBranches: [{ name, head }]; a local branch checked out in a copy is never deleted.
 export function planCleanup({ copies = [], prs = [], queue = [], protectedPaths = [], localBranches = [], remoteBranches = [], staleDays = 7 }) {
@@ -28,10 +28,12 @@ export function planCleanup({ copies = [], prs = [], queue = [], protectedPaths 
   const bases = new Set([...prs.filter((p) => p.state === 'OPEN').map((p) => p.baseRefName), ...queue.map((t) => t.base)].filter(Boolean));
   const plan = { removeCopies: [], keepCopies: [], report: [], deleteLocal: [], deleteRemote: [] };
   const removed = new Set();
+  const BG = { MERGED: 'слят', CLOSED: 'затворен' };
   for (const copy of copies) {
-    const keep = (why, ask = false) => {
+    // why is for the log; bg is the same in Bulgarian, for the comment in Linear.
+    const keep = (why, ask = false, bg = why) => {
       plan.keepCopies.push({ path: copy.path, branch: copy.branch, why });
-      if (ask) plan.report.push({ path: copy.path, branch: copy.branch, why });
+      if (ask) plan.report.push({ path: copy.path, branch: copy.branch, why, bg });
     };
     if (protectedPaths.includes(copy.path)) { keep('the runner needs it'); continue; }
     if (!copy.branch) { keep('detached, not a task copy'); continue; }
@@ -40,12 +42,19 @@ export function planCleanup({ copies = [], prs = [], queue = [], protectedPaths 
     if (!pr) {
       // Nothing stays forever unnoticed: a copy with no PR and no task for a week is reported once.
       const stale = (copy.ageDays ?? 0) >= staleDays;
-      keep(stale ? `no PR and no task for ${Math.floor(copy.ageDays)} days` : 'no PR yet', stale);
+      const days = Math.floor(copy.ageDays ?? 0);
+      keep(stale ? `no PR and no task for ${days} days` : 'no PR yet', stale, `няма PR и задача от ${days} дни`);
       continue;
     }
     if (!over(pr)) { keep(`PR #${pr.number} is open`); continue; }
-    if (copy.dirty) { keep(`PR #${pr.number} is ${pr.state.toLowerCase()} but the copy has uncommitted changes`, true); continue; }
-    if (copy.head !== pr.headRefOid) { keep(`PR #${pr.number} is ${pr.state.toLowerCase()} but the copy has commits that are not in it`, true); continue; }
+    if (copy.dirty) {
+      keep(`PR #${pr.number} is ${pr.state.toLowerCase()} but the copy has uncommitted changes`, true, `PR #${pr.number} е ${BG[pr.state]}, но в копието има незаписани промени`);
+      continue;
+    }
+    if (copy.head !== pr.headRefOid) {
+      keep(`PR #${pr.number} is ${pr.state.toLowerCase()} but the copy has commits that are not in it`, true, `PR #${pr.number} е ${BG[pr.state]}, но в копието има commit-и, които не са в него`);
+      continue;
+    }
     plan.removeCopies.push({ path: copy.path, branch: copy.branch, why: `PR #${pr.number} is ${pr.state.toLowerCase()}` });
     removed.add(copy.branch);
   }
