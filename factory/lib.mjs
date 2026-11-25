@@ -121,6 +121,15 @@ export function shouldRerunEvals(failed, item) {
   return Array.isArray(failed) && failed.length === 1 && failed[0] === 'evals' && !item.evalReruns;
 }
 
+// What a queued fix round does when the runner looks at its PR again just before the session (INV-60): 'ci' when
+// the PR no longer fails (fixed meanwhile, or CI runs again), 'rerun-evals' when only the evals fail and they were
+// not run again yet, otherwise 'run' with the failures as they are now.
+export function fixPrecheck(result, item) {
+  if (result?.verdict !== 'fail') return 'ci';
+  if (shouldRerunEvals(result.failed, item)) return 'rerun-evals';
+  return 'run';
+}
+
 // Pick the next task to run: the first one that is not waiting for CI and whose dependencies are merged
 // into its own base. mergedByBase maps a base branch to the set of task ids merged into it.
 export function nextRunnable(queue, mergedByBase) {

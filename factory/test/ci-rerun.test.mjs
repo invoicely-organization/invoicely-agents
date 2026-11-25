@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { fixMessage, shouldRerunEvals } from '../lib.mjs';
+import { fixMessage, fixPrecheck, shouldRerunEvals } from '../lib.mjs';
+
+test('a queued fix round looks at its PR again: no session when it no longer fails, evals alone are rerun first (INV-60)', () => {
+  assert.equal(fixPrecheck({ verdict: 'pending' }, {}), 'ci');
+  assert.equal(fixPrecheck({ verdict: 'merged' }, {}), 'ci');
+  assert.equal(fixPrecheck({ verdict: 'fail', failed: ['evals'] }, {}), 'rerun-evals');
+  assert.equal(fixPrecheck({ verdict: 'fail', failed: ['evals'] }, { evalReruns: 1 }), 'run');
+  assert.equal(fixPrecheck({ verdict: 'fail', failed: ['merge conflict with feature/INV-10'] }, {}), 'run');
+  assert.equal(fixPrecheck({ verdict: 'fail', failed: ['evals', 'review'] }, {}), 'run');
+});
 
 test('when only the evals failed, CI runs them once more before an agent is woken up (INV-53)', () => {
   assert.equal(shouldRerunEvals(['evals'], {}), true);

@@ -23,7 +23,7 @@ import { answerAfter, planFromReady } from './linear-sync.mjs';
 import { cleanupSummary, oldLogs, parseWorktrees, planCleanup } from './janitor.mjs';
 import { alreadyUpdated, copyMatchesPr, mergeBaseInto } from './update-branch.mjs';
 import {
-  blockingDeps, checksVerdict, classify, conflictOnly, failedChecks, fillTemplate, findPrUrl, fixMessage, inWindow, isFeatureBranch,
+  blockingDeps, checksVerdict, classify, conflictOnly, failedChecks, fixPrecheck, fillTemplate, findPrUrl, fixMessage, inWindow, isFeatureBranch,
   budgetAnswer, entryCosts, featurePrBody, featureReady, minutesBetween, nextRunnable, nextWindowStart, nightReport, nightStart, parseLimitReset, parseResult,
   servicePlist, sessionBudget, sessionDirName, shouldRerunEvals, spendingPeriod, spentSince, statusAction, taskSpent,
 } from './lib.mjs';
@@ -266,13 +266,23 @@ async function fixStillNeeded(task) {
     const up = await tryUpdateBranch(task);
     if (up.merged || up.pending) result = { verdict: 'pending' };
   }
-  if (result.verdict === 'fail') return true;
-  updateItem(task.issue, {
-    stage: 'ci', ciSince: new Date().toISOString(), fixRounds: Math.max(0, (task.fixRounds ?? 1) - 1),
-    session: task.session ?? task.resumeSession, resumeSession: undefined, message: undefined,
-  });
-  log(`${task.issue}: its PR no longer fails (${result.verdict}), so no fix session: back to waiting for CI`);
-  return false;
+  const backToCi = (extra, why) => {
+    updateItem(task.issue, {
+      stage: 'ci', ciSince: new Date().toISOString(), fixRounds: Math.max(0, (task.fixRounds ?? 1) - 1),
+      session: task.session ?? task.resumeSession, resumeSession: undefined, message: undefined, ...extra,
+    });
+    log(`${task.issue}: ${why}, so no fix session: back to waiting for CI`);
+    return false;
+  };
+  const next = fixPrecheck(result, task);
+  if (next === 'ci') return backToCi({}, `its PR no longer fails (${result.verdict})`);
+  // It still fails, maybe for another reason than when the round was queued (on 25.11 PR #20: a conflict then,
+  // other agents' evals now). The same rules as in processCi: evals alone are run once more first, and the agent
+  // gets the failures as they are now, not the old message.
+  if (next === 'rerun-evals' && (await rerunFailedJobs(task))) return backToCi({ evalReruns: 1 }, 'only the evals fail and CI runs them once more');
+  task.message = fixMessage({ pr: task.pr, failed: result.failed, branch: task.branch, base: task.base });
+  updateItem(task.issue, { message: task.message });
+  return true;
 }
 
 // Runs the failed jobs of the PR's last CI run again: as the bot, or as Yoan when the App may not (INV-53).
