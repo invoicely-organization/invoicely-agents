@@ -218,6 +218,11 @@ async function gh(args, { asBot = false, json = false, cwd = AGENTS_REPO } = {})
 
 // --- The role guard after every session ---
 
+// The policy comes from the plugin's copy at origin/main, not from the task's branch.
+function guardViolations(wt, before, role) {
+  return policyViolations(wt, before, role, path.join(ensureRuntime(), 'policies', 'role-guard.yaml'));
+}
+
 // The runner's own git never runs hooks: nothing a session wrote may run with the bot's token.
 const NO_HOOKS = ['-c', 'core.hooksPath=/dev/null'];
 
