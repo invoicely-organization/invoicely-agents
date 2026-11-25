@@ -92,6 +92,12 @@ export function blockingDeps(task, merged) {
   return (task.dependsOn ?? []).filter((dep) => !merged.has(dep));
 }
 
+// A PR whose one problem is a conflict with its base: the runner tries its own merge before an agent is woken up
+// (factory/update-branch.mjs).
+export function conflictOnly(failed) {
+  return Array.isArray(failed) && failed.length > 0 && failed.every((f) => f.startsWith('merge conflict'));
+}
+
 export function fixMessage({ pr, failed, branch, base }) {
   const conflict = failed.some((f) => f.startsWith('merge conflict'));
   const review = failed.includes('review');

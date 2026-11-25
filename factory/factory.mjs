@@ -21,8 +21,9 @@ import { appSettings, installationToken, sessionEnv, writeGhConfig } from './git
 import { linearClient, mention } from './linear.mjs';
 import { answerAfter, planFromReady } from './linear-sync.mjs';
 import { cleanupSummary, oldLogs, parseWorktrees, planCleanup } from './janitor.mjs';
+import { alreadyUpdated, copyMatchesPr, mergeBaseInto } from './update-branch.mjs';
 import {
-  blockingDeps, checksVerdict, classify, failedChecks, fillTemplate, findPrUrl, fixMessage, inWindow, isFeatureBranch,
+  blockingDeps, checksVerdict, classify, conflictOnly, failedChecks, fillTemplate, findPrUrl, fixMessage, inWindow, isFeatureBranch,
   budgetAnswer, entryCosts, featurePrBody, featureReady, minutesBetween, nextRunnable, nextWindowStart, nightReport, nightStart, parseLimitReset, parseResult,
   servicePlist, sessionBudget, sessionDirName, shouldRerunEvals, spendingPeriod, spentSince, statusAction, taskSpent,
 } from './lib.mjs';
@@ -213,6 +214,57 @@ async function advanceCi(item) {
   if (verdict !== 'pass') return { verdict, failed: failedChecks(checks) };
   await gh(['pr', 'merge', item.pr, '--squash'], { asBot: true });
   return { verdict: 'merged' };
+}
+
+// A conflict only in union files (policies/role-guard.yaml) is the runner's to fix: it merges the base into the task's
+// copy as the bot and pushes, with no session and no fix round (factory/update-branch.mjs). Returns { merged } or
+// { pending } when GitHub has not yet seen an earlier fixing push, or { why } when the agent has to do it.
+async function updateBranch(item) {
+  const wt = taskCopyPath(item);
+  if (!fs.existsSync(wt)) return { why: 'the task has no copy on disk' };
+  git(wt, ['fetch', '-q', 'origin']);
+  if (alreadyUpdated({ cwd: wt, base: item.base, branch: item.branch })) return { pending: true };
+  if (!copyMatchesPr({ cwd: wt, branch: item.branch })) return { why: 'the copy is not the PR\'s head' };
+  const identity = await sessionIdentity();
+  const env = identity ? sessionEnv({ ...process.env }, identity) : { ...process.env };
+  const result = mergeBaseInto({
+    cwd: wt, ref: `origin/${item.base}`, attributesFile: path.join(config.repo, '.gitattributes'), env,
+    message: `${item.issue}: merge ${item.base} (by the runner: the only conflict was in union files)`,
+  });
+  if (!result.merged) return { why: result.why };
+  execFileSync('git', ['push', '-q', 'origin', `HEAD:${item.branch}`], { cwd: wt, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  return { merged: true };
+}
+
+async function tryUpdateBranch(item) {
+  const up = await updateBranch(item).catch((error) => ({ why: error.message.split('\n')[0] }));
+  if (up.merged) log(`${item.issue}: merged ${item.base} into ${item.branch} itself (only union files conflicted); CI runs again`);
+  else if (!up.pending) log(`${item.issue}: cannot merge ${item.base} itself (${up.why}); the agent gets the fix round`);
+  return up;
+}
+
+// A fix round waits for the night, and by then its PR may be fixed (by Yoan, by Claude, by the runner's own merge)
+// or green after a rerun. The runner looks again before it wakes the agent, like a job that checks its precondition
+// when it starts instead of when it was queued. Returns false when the session is not needed.
+async function fixStillNeeded(task) {
+  let result;
+  try {
+    result = await advanceCi(task);
+  } catch (error) {
+    log(`${task.issue}: ci: ${error.message}`);
+    return true;
+  }
+  if (result.verdict === 'fail' && conflictOnly(result.failed)) {
+    const up = await tryUpdateBranch(task);
+    if (up.merged || up.pending) result = { verdict: 'pending' };
+  }
+  if (result.verdict === 'fail') return true;
+  updateItem(task.issue, {
+    stage: 'ci', ciSince: new Date().toISOString(), fixRounds: Math.max(0, (task.fixRounds ?? 1) - 1),
+    session: task.session ?? task.resumeSession, resumeSession: undefined, message: undefined,
+  });
+  log(`${task.issue}: its PR no longer fails (${result.verdict}), so no fix session: back to waiting for CI`);
+  return false;
 }
 
 // Runs the failed jobs of the PR's last CI run again: as the bot, or as Yoan when the App may not (INV-53).
@@ -575,6 +627,11 @@ async function processCi() {
       if (entry.status === 'merged') await reportToLinear(entry, '');
       await cleanup({ only: item.branch }); // the task's copy and branch go with it (INV-48)
       continue;
+    }
+    if (result.verdict === 'fail' && conflictOnly(result.failed)) {
+      const up = await tryUpdateBranch(item);
+      if (up.merged) updateItem(item.issue, { ciSince: new Date().toISOString() });
+      if (up.merged || up.pending) continue;
     }
     if (result.verdict === 'fail' && shouldRerunEvals(result.failed, item) && (await rerunFailedJobs(item))) {
       updateItem(item.issue, { evalReruns: 1, ciSince: new Date().toISOString() });
@@ -1055,6 +1112,8 @@ async function runQueue(now) {
       await sleep((waitingForCi ? 2 : 5) * 60 * 1000);
       continue;
     }
+    // Checked at any hour, like CI: a PR fixed by day goes back to waiting for CI and is merged by day.
+    if (task.pr && task.fixRounds && task.message && !(await fixStillNeeded(task))) continue;
     if (!now && !inWindow(new Date(), config.windowStart, config.windowEnd)) {
       await reportNight(`Нощта свърши. В опашката остават: ${queue.map((t) => `${t.issue}${t.stage === 'ci' ? ' (чака CI)' : ''}`).join(', ')}.`);
       // By day: no sessions, but CI, merges and Linear (answers, tasks in Ready) are still followed every 5 minutes.
