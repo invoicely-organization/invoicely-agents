@@ -69,10 +69,13 @@ try {
 
 const ALLOWED_TOOLS = [
   'Agent', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
-  'Bash(claude plugin validate:*)', 'Bash(claude plugin eval:*)', 'Bash(node --test:*)', 'Bash(node:*)',
+  // node only for tests and the repo's own scripts, not `node -e`; no cat: Read does that and the secret guard
+  // checks it (INV-51). factory/ is the runner's, not the agents'.
+  'Bash(claude plugin validate:*)', 'Bash(claude plugin eval:*)', 'Bash(node --test:*)', 'Bash(node --check:*)',
+  'Bash(node scripts/:*)', 'Bash(node hooks/:*)', 'Bash(node evals/:*)',
   'Bash(git status:*)', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git add:*)', 'Bash(git commit:*)', 'Bash(git push:*)',
   'Bash(gh pr create:*)', 'Bash(gh pr view:*)', 'Bash(gh pr checks:*)', 'Bash(gh run view:*)', 'Bash(gh run list:*)',
-  'Bash(git fetch:*)', 'Bash(git merge:*)', 'Bash(ls:*)', 'Bash(mkdir:*)', 'Bash(chmod:*)', 'Bash(cat:*)',
+  'Bash(git fetch:*)', 'Bash(git merge:*)', 'Bash(ls:*)', 'Bash(mkdir:*)', 'Bash(chmod:*)',
 ];
 
 function readJson(file, fallback) {

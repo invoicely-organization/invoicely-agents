@@ -1,0 +1,44 @@
+import assert from 'node:assert/strict';
+import { mkdirSync } from 'node:fs';
+import path from 'node:path';
+import { test } from 'node:test';
+import { runHook, tempDir } from './helpers.mjs';
+
+const home = tempDir('secret-guard-home-');
+const state = path.join(home, '.invoicely');
+const work = path.join(home, 'projects', 'invoicely-agents', '.claude', 'worktrees', 'inv-51');
+mkdirSync(work, { recursive: true });
+const call = (tool_name, tool_input, cwd = work) => runHook('secret-guard.mjs', { hook_event_name: 'PreToolUse', tool_name, cwd, tool_input }, { HOME: home, INVOICELY_HOME: state });
+
+test('ordinary work passes: the agent\'s own files, tests, the queue is not touched', () => {
+  assert.equal(call('Read', { file_path: path.join(work, 'agents', 'reviewer.md') }).denied, false);
+  assert.equal(call('Grep', { pattern: 'cell 18', path: work }).denied, false);
+  assert.equal(call('Glob', { pattern: 'evals/**/case.yaml' }).denied, false);
+  assert.equal(call('Bash', { command: 'node --test hooks/test/*.test.mjs && git status' }).denied, false);
+  assert.equal(call('Edit', { file_path: path.join(work, 'skills', 'bg-vat', 'SKILL.md') }).denied, false);
+});
+
+test('the runner\'s key, tokens and the personal originals cannot be read, which a probe did on 25.11', () => {
+  assert.equal(call('Read', { file_path: path.join(state, 'github-app.pem') }).denied, true);
+  assert.equal(call('Read', { file_path: '~/.invoicely/.env' }).denied, true);
+  assert.equal(call('Grep', { pattern: 'token', path: path.join(state, 'gh-bot') }).denied, true);
+  assert.equal(call('Glob', { pattern: `${state}/originals/**` }).denied, true);
+  assert.equal(call('Read', { file_path: path.join(state, 'cache', 'linear-app-token.json') }).denied, true);
+});
+
+test('Bash cannot reach them either, by absolute, home or relative path', () => {
+  assert.equal(call('Bash', { command: `cat ${path.join(state, 'github-app.pem')}` }).denied, true);
+  assert.equal(call('Bash', { command: 'node -e "console.log(require(\'fs\').readFileSync(process.env.HOME + \'/.invoicely/.env\', \'utf8\'))"' }).denied, true);
+  assert.equal(call('Bash', { command: 'cat $HOME/.config/gh/hosts.yml' }).denied, true);
+  assert.equal(call('Bash', { command: 'cat ../../.invoicely/github-app.pem' }, path.join(home, 'projects', 'x')).denied, true);
+  assert.equal(call('Bash', { command: 'security find-generic-password -s claude -w' }).denied, true);
+  assert.equal(call('Bash', { command: 'ls ~/.ssh' }).denied, true);
+});
+
+test('key and env files anywhere are secret, and writing them is blocked too', () => {
+  assert.equal(call('Write', { file_path: path.join(work, '.env') }).denied, true);
+  assert.equal(call('Read', { file_path: path.join(work, 'deploy', 'server.pem') }).denied, true);
+  assert.equal(call('Read', { file_path: path.join(work, '.env.local') }).denied, true);
+  assert.equal(call('Read', { file_path: path.join(work, 'docs', 'environment.md') }).denied, false);
+  assert.equal(call('Read', { file_path: path.join(work, '.env.example') }).denied, false);
+});
