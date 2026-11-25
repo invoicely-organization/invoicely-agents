@@ -22,8 +22,8 @@ import { linearClient, mention } from './linear.mjs';
 import { answerAfter, planFromReady } from './linear-sync.mjs';
 import {
   blockingDeps, checksVerdict, classify, failedChecks, fillTemplate, findPrUrl, fixMessage, inWindow, isFeatureBranch,
-  minutesBetween, nextRunnable, nextWindowStart, nightReport, nightStart, parseLimitReset, parseResult, sessionBudget,
-  sessionDirName, spentSince,
+  entryCosts, minutesBetween, nextRunnable, nextWindowStart, nightReport, nightStart, parseLimitReset, parseResult,
+  sessionBudget, sessionDirName, spendingPeriod, spentSince, taskSpent,
 } from './lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -33,11 +33,12 @@ const config = {
   repo: path.join(HOME, 'projects/invoicely-agents'),
   worktrees: path.join(HOME, 'projects/ia-wt'),
   pluginRef: 'origin/main',
-  budgetUsd: 15,
+  budgetUsd: 15, // API dollars a task's sessions may spend over all their runs; a task's own budgetUsd overrides it
   windowStart: 22,
   windowEnd: 8,
   nodeBin: '',
   nightBudgetUsd: 60, // API dollars a night may spend on sessions and CI evals; then the runner stops until the next night
+  dayBudgetUsd: 20, // the same for the day between two nights, when the runner is started with --now
   reportProjectId: 'a2abfb0c-4d55-41a7-8719-3838050c6d0c', // Linear project "M0 Инфраструктура": the night report goes there
   ...readJson(path.join(STATE, 'config.json'), {}),
 };
@@ -262,6 +263,11 @@ async function reportToLinear(entry, resultText) {
       waitForYoan = true;
       body = ask(`задачата зависи от ${entry.blockedBy.join(', ')}, която не е слята в \`${entry.base}\` и не е в опашката.`,
         'добави зависимостта в опашката или махни зависимостта. Предложение: добави я.', 'задачата не тръгва.');
+    } else if (entry.status === 'over_budget') {
+      waitForYoan = true;
+      body = ask(`задачата стигна тавана си: сесиите ѝ са похарчили $${entry.spentUsd.toFixed(2)} от $${entry.capUsd} (цена по API; на Max е дял от лимита).`,
+        `пиши тук "продължи", за да получи още $${config.budgetUsd}, или "спри". Предложение: "продължи", ако PR-ът е близо до готов.`,
+        'задачата стои извън опашката и не харчи нищо.');
     } else if (entry.status === 'limit') body = `**Спрян от лимита на Max.** ${head} Подновява се сам в ${entry.resetAt}.`;
     else if (entry.status === 'error') body = `**Грешка.** ${head}\n\n${resultText.slice(0, 1500)}`;
     else {
@@ -350,9 +356,12 @@ async function runTask(task, budgetCap) {
     const status = classify(result);
     const ended = new Date();
     const reset = parseLimitReset(result.text, ended);
+    const session = result.sessionId || latestSession(wt);
+    // result.costUsd is the session's running total; the entry keeps it and what this run itself cost (INV-47).
+    const runCost = result.costUsd == null ? null : entryCosts([...readLedger(), { session, sessionCostUsd: result.costUsd }]).at(-1);
     const entry = {
-      issue: task.issue, branch: task.branch, base: prBase, session: result.sessionId || latestSession(wt), started: started.toISOString(),
-      ended: ended.toISOString(), minutes: minutesBetween(started, ended), status, exitCode: code, costUsd: result.costUsd,
+      issue: task.issue, branch: task.branch, base: prBase, session, started: started.toISOString(),
+      ended: ended.toISOString(), minutes: minutesBetween(started, ended), status, exitCode: code, costUsd: runCost, sessionCostUsd: result.costUsd,
       turns: result.turns, pr: findPrUrl(result.text), resetAt: reset ? reset.toString() : null, resumedFrom: task.resumeSession ?? null, actor: identity ? identity.name : 'yoan', log: logFile,
     };
     fs.appendFileSync(LEDGER, `${JSON.stringify(entry)}\n`);
@@ -436,14 +445,25 @@ async function reportNight(reason) {
   const entries = readLedger();
   if (!entries.some((e) => e.ended && Date.parse(e.ended) >= since.getTime())) return;
   const body = `${nightReport(entries, since, config.nightBudgetUsd)}\n\n${reason}`;
+  // A report that did not reach Linear (no network after the Mac wakes) is tried again on the next round, up to
+  // 12 times (about an hour); before INV-47 it was marked as sent and never reached Linear.
+  const key = since.toISOString();
+  const tries = (state.tries?.[key] ?? 0) + 1;
+  let sent = false;
   try {
     const ok = await linear('mutation($p:String!,$b:String!){projectUpdateCreate(input:{projectId:$p,body:$b}){success}}', { p: config.reportProjectId, b: body });
-    if (ok === null) log('night report: no LINEAR_API_KEY, report only in the log');
+    if (ok === null) log('night report: no Linear key, report only in the log');
+    sent = true;
   } catch (error) {
-    log(`night report: ${error.message}`);
+    log(`night report (try ${tries} of 12): ${error.message}`);
   }
-  log(`night report\n${body}`);
-  state.nights = [...state.nights.slice(-30), since.toISOString()];
+  if (tries === 1) log(`night report\n${body}`);
+  if (sent || tries >= 12) {
+    state.nights = [...state.nights.slice(-30), key];
+    if (state.tries) delete state.tries[key];
+  } else {
+    state.tries = { ...(state.tries ?? {}), [key]: tries };
+  }
   fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
 }
 
@@ -511,8 +531,8 @@ async function mergedByBase(queue) {
 // A dependency that waits for Yoan's answer (a question, a red CI) is not gone: its answer puts it back in the queue.
 async function dropBlocked(queue, merged) {
   const last = new Map();
-  for (const e of readLedger()) if (['needs_answer', 'ci_failed', 'answered', 'merged', 'error', 'blocked', 'closed'].includes(e.status)) last.set(e.issue, e.status);
-  const waitingForYoan = (id) => ['needs_answer', 'ci_failed'].includes(last.get(id));
+  for (const e of readLedger()) if (['needs_answer', 'ci_failed', 'over_budget', 'answered', 'merged', 'error', 'blocked', 'closed'].includes(e.status)) last.set(e.issue, e.status);
+  const waitingForYoan = (id) => ['needs_answer', 'ci_failed', 'over_budget'].includes(last.get(id));
   for (const task of queue) {
     if (task.stage === 'ci') continue;
     const missing = blockingDeps(task, merged.get(task.base || 'main') ?? new Set()).filter((dep) => !queue.some((q) => q.issue === dep) && !waitingForYoan(dep));
@@ -586,11 +606,28 @@ async function takeAnswers() {
   const queue = readJson(QUEUE, []);
   for (const issue of data.issues.nodes) {
     if (queue.some((t) => t.issue === issue.identifier)) continue;
-    const last = [...entries].reverse().find((e) => e.issue === issue.identifier && ['needs_answer', 'ci_failed', 'answered'].includes(e.status));
-    if (!last || last.status === 'answered' || !last.session) continue;
+    const last = [...entries].reverse().find((e) => e.issue === issue.identifier && ['needs_answer', 'ci_failed', 'over_budget', 'answered'].includes(e.status));
+    if (!last || last.status === 'answered') continue;
+    if (last.status === 'over_budget' ? !last.task : !last.session) continue;
     const answer = answerAfter(issue.comments.nodes, yoanId, last.ended);
     if (!answer) continue;
     ledger({ issue: issue.identifier, ended: new Date().toISOString(), status: 'answered' });
+    if (last.status === 'over_budget') {
+      if (/спри/i.test(answer)) {
+        log(`linear: ${issue.identifier}: Yoan stops it at its cap`);
+        continue;
+      }
+      const task = { ...last.task, budgetUsd: last.capUsd + config.budgetUsd };
+      if (!/^\s*продължи\W*$/i.test(answer) && task.resumeSession) {
+        task.message = `Yoan answered in Linear:\n\n${answer}\n\n${task.message ?? 'Continue exactly where you stopped and finish the same instructions.'}`;
+      }
+      const latest = readJson(QUEUE, []);
+      latest.unshift(task);
+      fs.writeFileSync(QUEUE, JSON.stringify(latest, null, 2));
+      await setState(issue.identifier, 'In Progress');
+      log(`linear: ${issue.identifier} goes on with a cap of $${task.budgetUsd}`);
+      continue;
+    }
     if (last.status === 'ci_failed' && /поемам/i.test(answer)) {
       log(`linear: ${issue.identifier}: Yoan takes it over`);
       continue;
@@ -619,6 +656,28 @@ async function syncFromLinear() {
   }
 }
 
+// The same line every 5 minutes says nothing new: a state is logged once.
+const loggedOnce = new Set();
+function logOnce(key, message) {
+  if (loggedOnce.has(key)) return;
+  loggedOnce.add(key);
+  log(message);
+}
+
+// A task over its cap leaves the queue and asks Yoan (INV-47). The entry keeps the task as it was, so that
+// "продължи" puts it back with one more default budget.
+async function stopOverBudget(task, spent, cap) {
+  const entry = {
+    issue: task.issue, branch: task.branch, base: task.base || 'main', ended: new Date().toISOString(), status: 'over_budget',
+    spentUsd: Math.round(spent * 100) / 100, capUsd: cap, session: task.resumeSession ?? task.session ?? null, task,
+    ...(task.pr ? { pr: task.pr } : {}),
+  };
+  ledger(entry);
+  updateItem(task.issue, null);
+  log(`${task.issue}: over its cap ($${entry.spentUsd} of $${cap}), taken out of the queue`);
+  await reportToLinear(entry, '');
+}
+
 async function runQueue(now) {
   for (;;) {
     await syncFromLinear();
@@ -645,17 +704,26 @@ async function runQueue(now) {
       await sleep(Math.min(5 * 60 * 1000, nextWindowStart(new Date(), config.windowStart) - Date.now()));
       continue;
     }
-    // The night cap: sessions and CI evals together; a session never gets more than what is left of the night.
-    const spent = spentSince(readLedger(), nightStart(new Date(), config.windowStart));
-    const budgetCap = sessionBudget(task.budgetUsd ?? config.budgetUsd, config.nightBudgetUsd, spent);
-    if (!now && budgetCap === 0) {
-      log(`night cap reached: $${spent.toFixed(2)} of $${config.nightBudgetUsd}; no new session until the next night`);
-      await sleep(Math.min(5 * 60 * 1000, nextWindowStart(new Date(), config.windowStart) - Date.now()));
+    // Two caps (INV-47): the task's, over all its sessions, and the period's (night or day), sessions and CI evals
+    // together. A session never gets more than what is left of either, also when started with --now.
+    const entries = readLedger();
+    const period = spendingPeriod(new Date(), config);
+    const periodSpent = spentSince(entries, period.start);
+    const taskCap = task.budgetUsd ?? config.budgetUsd;
+    const spentOnTask = taskSpent(entries, task.issue);
+    const { budget, stoppedBy } = sessionBudget({ taskCap, taskSpent: spentOnTask, periodCap: period.cap, periodSpent });
+    if (budget === 0 && stoppedBy === 'task') {
+      await stopOverBudget(task, spentOnTask, taskCap);
+      continue;
+    }
+    if (budget === 0) {
+      logOnce(`cap:${period.kind}:${period.start.toISOString()}`, `${period.kind} cap reached: $${periodSpent.toFixed(2)} of $${period.cap}; no new session until the next period`);
+      await sleep(5 * 60 * 1000);
       continue;
     }
     let result;
     try {
-      result = await runTask(task, now ? undefined : budgetCap);
+      result = await runTask(task, budget);
     } catch (error) {
       // A run that could not even start (no network after the Mac wakes, GitHub down) keeps its place in the queue
       // and is tried again in 5 minutes; only after 6 failed starts in a row is it taken out.
@@ -697,14 +765,18 @@ async function main() {
     console.log('locks:', fs.readdirSync(path.join(STATE, 'locks')).join(', ') || 'none');
     const app = appSettings(STATE);
     console.log('github:', app ? `${app.slug}[bot] (App ${app.appId}, installation ${app.installationId})` : 'Yoan (no GitHub App in config.json)');
-    const since = nightStart(new Date(), config.windowStart);
-    console.log(`night since ${since.toLocaleString()}: $${spentSince(readLedger(), since).toFixed(2)} of $${config.nightBudgetUsd}`);
-    const runs = fs.existsSync(LEDGER) ? fs.readFileSync(LEDGER, 'utf8').trim().split('\n').slice(-10) : [];
-    console.log('last runs:');
-    for (const line of runs) {
-      const r = JSON.parse(line);
-      console.log(`  ${r.ended} ${r.issue} ${r.status} ${r.minutes}min $${r.costUsd ?? '?'} ${r.pr ?? ''}`);
+    const entries = readLedger();
+    const period = spendingPeriod(new Date(), config);
+    console.log(`${period.kind} since ${period.start.toLocaleString()}: $${spentSince(entries, period.start).toFixed(2)} of $${period.cap}`);
+    for (const t of readJson(QUEUE, [])) {
+      console.log(`  ${t.issue}: sessions $${taskSpent(entries, t.issue).toFixed(2)} of $${t.budgetUsd ?? config.budgetUsd}`);
     }
+    const costs = entryCosts(entries);
+    console.log('last runs:');
+    entries.forEach((r, i) => {
+      if (i < entries.length - 10) return;
+      console.log(`  ${r.ended} ${r.issue} ${r.status}${r.minutes == null ? '' : ` ${r.minutes}min`} $${costs[i].toFixed(2)} ${r.pr ?? ''}`);
+    });
     return undefined;
   }
   console.log('usage: factory queue add <INV-xx> --branch <b> --brief <file> [...] | factory queue run [--now] | factory run <INV-xx> ... | factory status');

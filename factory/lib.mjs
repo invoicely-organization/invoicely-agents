@@ -121,37 +121,80 @@ export function nightStart(now, startHour) {
   return start;
 }
 
-// What a night has cost so far: sessions and CI evals from the ledger, in API dollars.
-export function spentSince(entries, since) {
-  return entries.filter((e) => e.ended && Date.parse(e.ended) >= since.getTime()).reduce((sum, e) => sum + (Number(e.costUsd) || 0), 0);
+// The spending period a moment belongs to: the night window, or the day between two nights. Each has its own cap,
+// so a run started by day with --now is capped too.
+export function spendingPeriod(now, { windowStart, windowEnd, nightBudgetUsd, dayBudgetUsd }) {
+  if (inWindow(now, windowStart, windowEnd)) return { kind: 'night', start: nightStart(now, windowStart), cap: nightBudgetUsd };
+  const start = new Date(now);
+  start.setHours(windowEnd, 0, 0, 0);
+  if (start > now) start.setDate(start.getDate() - 1);
+  return { kind: 'day', start, cap: dayBudgetUsd };
 }
 
-// The budget a session may get: its own cap, but never more than what is left of the night.
-export function sessionBudget(taskBudget, nightCap, spent) {
-  const left = nightCap - spent;
-  return left < 2 ? 0 : Math.min(taskBudget, Math.floor(left * 100) / 100);
+// Claude's total_cost_usd is what the whole session has cost so far, also after --resume. So the entry of a resumed
+// run holds the session's running total: in sessionCostUsd since INV-47, in costUsd before. entryCosts turns the
+// ledger into what each entry itself cost, in ledger order: the running total minus the session's previous total.
+// A session first seen with a total (it began before the ledger) counts that total once. CI evals count as they are.
+export function entryCosts(entries) {
+  const totals = new Map();
+  return entries.map((e) => {
+    if (e.status === 'ci-evals') return Number(e.costUsd) || 0;
+    const value = e.sessionCostUsd ?? e.costUsd;
+    if (value == null || !Number.isFinite(Number(value))) return 0;
+    const total = Number(value);
+    if (!e.session) return total;
+    const before = totals.get(e.session);
+    totals.set(e.session, total);
+    return before !== undefined && total >= before ? Math.round((total - before) * 1e6) / 1e6 : total;
+  });
+}
+
+// What was spent since a moment: sessions and CI evals, in API dollars. Pass the whole ledger, so that a session
+// resumed tonight is counted from where it stopped before.
+export function spentSince(entries, since) {
+  const costs = entryCosts(entries);
+  return entries.reduce((sum, e, i) => (e.ended && Date.parse(e.ended) >= since.getTime() ? sum + costs[i] : sum), 0);
+}
+
+// What a task's sessions have cost over all its runs. CI evals are left out: the task cap limits what the agent
+// spends, and the evals count against the period cap.
+export function taskSpent(entries, issue) {
+  const costs = entryCosts(entries);
+  return entries.reduce((sum, e, i) => (e.issue === issue && e.status !== 'ci-evals' ? sum + costs[i] : sum), 0);
+}
+
+// The budget of the next session: what is left of the task's cap and of the period's cap, whichever is smaller.
+// Under $2 left is not worth a session; stoppedBy says which cap stops it.
+export function sessionBudget({ taskCap, taskSpent: spentOnTask = 0, periodCap, periodSpent = 0 }) {
+  const taskLeft = taskCap - spentOnTask;
+  const periodLeft = periodCap - periodSpent;
+  const left = Math.min(taskLeft, periodLeft);
+  if (left < 2) return { budget: 0, stoppedBy: taskLeft <= periodLeft ? 'task' : 'period' };
+  return { budget: Math.floor(left * 100) / 100, stoppedBy: null };
 }
 
 const STATUS_BG = {
   done: 'PR отворен', merged: 'слято', needs_answer: 'въпрос към теб', limit: 'спрян от лимита', error: 'грешка',
-  ci_failed: 'червен CI', blocked: 'блокирана', closed: 'PR затворен', 'ci-evals': 'evals в CI',
+  ci_failed: 'червен CI', blocked: 'блокирана', closed: 'PR затворен', 'ci-evals': 'evals в CI', over_budget: 'над тавана',
+  answered: 'отговорено',
 };
 
 // The night report for Linear: one line per task, the evals in CI, the total against the cap.
 export function nightReport(entries, since, nightCap) {
-  const night = entries.filter((e) => e.ended && Date.parse(e.ended) >= since.getTime());
+  const costs = entryCosts(entries);
   const byTask = new Map();
-  for (const e of night) {
+  entries.forEach((e, i) => {
+    if (!e.ended || Date.parse(e.ended) < since.getTime()) return;
     const row = byTask.get(e.issue) ?? { sessions: 0, minutes: 0, session$: 0, ci$: 0, last: '', pr: null };
-    if (e.status === 'ci-evals') row.ci$ += Number(e.costUsd) || 0;
+    if (e.status === 'ci-evals') row.ci$ += costs[i];
     else {
       if (e.minutes != null) { row.sessions += 1; row.minutes += e.minutes; }
-      row.session$ += Number(e.costUsd) || 0;
+      row.session$ += costs[i];
       row.last = STATUS_BG[e.status] ?? e.status;
     }
     row.pr = e.pr ?? row.pr;
     byTask.set(e.issue, row);
-  }
+  });
   const total = spentSince(entries, since);
   const lines = [
     `**Нощта от ${since.toLocaleDateString('bg-BG')}**: общо $${total.toFixed(2)} от тавана $${nightCap} (цена по API; на Max това е дял от лимита, не плащане).`,
