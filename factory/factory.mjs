@@ -33,7 +33,7 @@ import { linearClient, mention } from './linear.mjs';
 import { answerAfter, planFromReady } from './linear-sync.mjs';
 import {
   budgetAnswer, classify, entryCosts, fillTemplate, findingLines, fixMessage, isReviewCheck, minutesBetween, nextRunnable,
-  parseOutcome, parseResult, retryAt, reviewDecision, reviewText, servicePlist, statusAction, summaryBody, taskCost, transcriptFile,
+  parseOutcome, parseResult, retryAt, reviewDecision, reviewText, servicePlist, sessionArgs, statusAction, summaryBody, taskCost, transcriptFile,
 } from './lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -325,14 +325,13 @@ function testsLine(task) {
 async function runSession(task, role, wt, budget) {
   const runtime = ensureRuntime();
   const sessions = task.sessions ?? {};
-  const base = ['--agent', `invoicely-agents:${role}`, '--plugin-dir', runtime, '--settings', SANDBOX, '--permission-mode', 'acceptEdits',
-    '--output-format', 'json', '--max-budget-usd', String(budget), '--allowedTools', ...COMMON_TOOLS, ...(REPO_TOOLS[task.repo] ?? [])];
+  const base = { role, pluginDir: runtime, sandboxFile: SANDBOX, budget, tools: [...COMMON_TOOLS, ...(REPO_TOOLS[task.repo] ?? [])] };
   let args;
   let id = sessions[role] && sessionExists(wt, sessions[role]) ? sessions[role] : null;
   if (sessions[role] && !id) log(`${task.issue}: ${role} session ${sessions[role]} has no transcript, so a new session starts`);
   const resumed = Boolean(id);
   if (id) {
-    args = ['-p', task.message || CONTINUE, '--resume', id, ...base];
+    args = sessionArgs({ ...base, prompt: task.message || CONTINUE, resume: id });
   } else {
     // The session gets its id up front and the queue remembers it, so a run cut off by a restart resumes it.
     id = crypto.randomUUID();
@@ -340,7 +339,7 @@ async function runSession(task, role, wt, budget) {
       ISSUE: task.issue, TASK: fs.readFileSync(task.brief, 'utf8').trim(), WT: wt, REPO: task.repo, BRANCH: task.branch, TESTS: testsLine(task),
     });
     const message = task.message && task.message !== CONTINUE ? task.message : '';
-    args = ['-p', message ? `${prompt}\n\n${message}` : prompt, '--session-id', id, ...base];
+    args = sessionArgs({ ...base, prompt: message ? `${prompt}\n\n${message}` : prompt, sessionId: id });
     updateItem(task.issue, { sessions: { ...sessions, [role]: id } });
   }
   const started = new Date();
