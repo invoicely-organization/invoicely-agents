@@ -61,7 +61,7 @@ export function planCleanup({ copies = [], prs = [], queue = [], protectedPaths 
   const checkedOut = new Set(copies.filter((c) => c.branch && !removed.has(c.branch)).map((c) => c.branch));
   const keptWithWork = new Set(plan.report.map((r) => r.branch));
   const deletable = (b) => {
-    if (KEEP_BRANCHES.test(b.name) || /^feature\//.test(b.name) || queued.has(b.name) || bases.has(b.name) || keptWithWork.has(b.name)) return false;
+    if (KEEP_BRANCHES.test(b.name) || queued.has(b.name) || bases.has(b.name) || keptWithWork.has(b.name)) return false;
     const pr = prForBranch(prs, b.name);
     return over(pr) && b.head === pr.headRefOid;
   };

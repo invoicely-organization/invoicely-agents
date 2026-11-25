@@ -3,7 +3,6 @@
     "enabled": true,
     "failIfUnavailable": true,
     "allowUnsandboxedCommands": false,
-    "excludedCommands": ["claude plugin eval:*"],
     "filesystem": {
       "denyRead": [
         "~/.invoicely",

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // PreToolUse hook for Write, Edit, MultiEdit and NotebookEdit.
-// A subagent may write only the paths policies/role-guard.yaml gives it. The main
-// session (no agent_type in the hook input) is not limited here.
+// An agent may write only the paths policies/role-guard.yaml gives it. The role is INVOICELY_ROLE, which the runner
+// sets for each of its sessions (test-author, implementer), so the whole session and its subagents have that role;
+// otherwise the agent_type of a subagent. An interactive session with neither is not limited here.
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,7 +16,7 @@ function deny(reason) {
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
       permissionDecision: 'deny',
-      permissionDecisionReason: `role guard: ${reason}. Do not work around this; report to the orchestrator which file you need changed and why.`,
+      permissionDecisionReason: `role guard: ${reason}. Do not work around this; say in your final report which file you need changed and why (a test that looks wrong goes back to test-author).`,
     },
   }));
   process.exit(0);
@@ -28,8 +29,9 @@ try {
   deny('the hook input could not be read');
 }
 
-if (!input.agent_type) process.exit(0);
-const agent = bareAgentName(input.agent_type);
+const role = process.env.INVOICELY_ROLE || input.agent_type;
+if (!role) process.exit(0);
+const agent = bareAgentName(role);
 
 const target = input.tool_input?.file_path ?? input.tool_input?.notebook_path;
 if (typeof target !== 'string' || target === '') deny(`${agent} tried to write without a file path`);

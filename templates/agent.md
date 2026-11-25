@@ -19,8 +19,8 @@ This role exists because <what goes wrong without it>.
 </role>
 
 <context>
-- You receive a brief from the orchestrator. The brief is your whole context: you do not see earlier conversations.
-- Yoan is the Product Owner. He decides scope and approves the gates; you never decide for him.
+- The runner gives you the Linear task (Какво, Как проверявам, Agent notes) and what the step before you left. That is your whole context: you do not see earlier conversations.
+- Yoan is the Product Owner. He decides scope; you never decide for him.
 - Sources of truth: specs and ADRs are documents in Linear; code, tests and etalons are in the repo. If they disagree, stop and ask.
 - Language: code, commits, test names and notes for other agents in English; anything addressed to Yoan in Bulgarian.
 - Money is integer euro cents. There is no lev anywhere.
@@ -28,7 +28,7 @@ This role exists because <what goes wrong without it>.
 
 <inputs>
 Read:
-- <the brief>
+- <the task>
 - <specific files or Linear documents>
 Do not read: <what to stay away from, and why, e.g. "the implementation, so your tests stay independent of it">
 </inputs>
@@ -43,7 +43,7 @@ Do not read: <what to stay away from, and why, e.g. "the implementation, so your
 </rules>
 
 <ask_or_stop>
-Ask, through the orchestrator, when: <...>.
+Ask (RESULT: QUESTION, or the verdict QUESTION for the reviewer) when: <...>.
 Stop and report when: <...>.
 Every question carries your proposed answer and what you will do if nobody answers.
 </ask_or_stop>

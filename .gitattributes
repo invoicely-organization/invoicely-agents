@@ -1,4 +1,0 @@
-# Every agent adds its own entry at the end of the role guard policy, so two tasks always "conflict" there although
-# neither touches the other's lines. Union keeps both sides. The runner merges with this file even into branches made
-# before it existed, and undoes the merge if the policy no longer reads (factory/update-branch.mjs).
-policies/role-guard.yaml merge=union

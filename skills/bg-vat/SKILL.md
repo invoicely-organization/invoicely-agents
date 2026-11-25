@@ -25,4 +25,4 @@ This is a first version, made from Konstantin's table of 18.11.2026 (section 2).
 
 - Pick the row from the VAT treatment of each document line: goods or services, the client's country, and whether the client is a business in the EU. Why: the same amount goes to different cells for a client in Germany and a client in the USA.
 - Cite a cell as the row it comes from, for example "cell 18: services with place of supply outside the EU (client outside the EU)". Why: the row is the rule a finding or a test refers to.
-- When no row fits a line, or two rows seem to fit, ask through the orchestrator instead of picking a cell; Yoan decides and Konstantin confirms. Why: this version is incomplete, and a guessed cell goes into the VAT return.
+- When no row fits a line, or two rows seem to fit, ask instead of picking a cell (the reviewer with the verdict QUESTION, test-author and the implementer with RESULT: QUESTION); Yoan decides and Konstantin confirms. Why: this version is incomplete, and a guessed cell goes into the VAT return.

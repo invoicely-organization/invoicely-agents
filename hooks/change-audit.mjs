@@ -97,10 +97,10 @@ if (violations.length === 0) {
 
 const reason = `role guard: ${agent} changed files outside its paths: ${violations.join('; ')}. `
   + 'Put these files back as they were (git checkout or git restore for tracked files, delete new ones), '
-  + 'then report to the orchestrator which change you need and why.';
+  + 'then say in your final report which change you need and why.';
 
 if (input.stop_hook_active) {
-  // Already sent back once; do not loop. The orchestrator sees the warning.
+  // Already sent back once; do not loop. The session's own report and the runner's diff check see it.
   rmSync(stateFile, { force: true });
   process.stdout.write(JSON.stringify({ systemMessage: `${reason} The subagent stopped without fixing it.` }));
   process.exit(0);

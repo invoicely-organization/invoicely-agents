@@ -1,13 +1,15 @@
-# The paths each agent may write, as globs relative to the product repo.
-# The role guard hook (PreToolUse on Write, Edit and Bash, INV-14) refuses a write
-# outside "allow" or inside "deny" for the agent that makes it. The hook knows the
-# agent from the agent_type field of the hook input.
-# Each agent gets its entry when its definition is added (INV-10, INV-17).
-# Change this file through a PR like any prompt; Yoan approves.
-prompt-engineer:
-  allow: ["agents/**", "skills/**", "evals/**", "templates/**", "fixtures/eval-workspace/**", "policies/role-guard.yaml"]
+# The paths each agent may write, as globs relative to the repo the task is in (invoicely or invoicely-agents).
+# The role guard hook (PreToolUse on Write and Edit) refuses a write outside "allow" or inside "deny" for the agent
+# that makes it, and after every session the runner checks the session's whole diff against the same rules, so a
+# write through Bash is caught too. The hook knows the agent from INVOICELY_ROLE, which the runner sets for its
+# sessions, or else from the agent_type of a subagent.
+# The etalons in fixtures/etalons are locked for every agent.
 test-author:
-  allow: ["**/*.test.ts", "**/*.test.tsx", "e2e/**"]
-# The reviewer reads and reports; it writes nothing (INV-31).
+  allow: ["**/*.test.ts", "**/*.test.tsx", "**/*.test.mjs", "**/*.test.js", "**/test/**", "e2e/**"]
+  deny: ["fixtures/etalons/**"]
+implementer:
+  allow: ["**"]
+  deny: ["**/*.test.ts", "**/*.test.tsx", "**/*.test.mjs", "**/*.test.js", "**/test/**", "e2e/**", "fixtures/etalons/**", "policies/**", ".github/**"]
+# The reviewer reads and reports; it writes nothing.
 reviewer:
   allow: []

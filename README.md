@@ -1,26 +1,39 @@
 # invoicely-agents
 
-The agents, domain skills, templates and evals that build Invoicely. The product repo `invoicely` uses this repo as a Claude Code plugin.
+The agents, hooks, review workflow and runner that build Invoicely. How we work is the Linear document "Процесът" (project M0); the map and the rules for Claude are in `CLAUDE.md`; the idea is in `HANDOFF.md`.
+
+## The process (INV-64)
+
+1. Yoan moves a task to Ready in Linear. The runner takes it, unless a task that blocks it is still open.
+2. test-author writes the tests from the task's "Как проверявам" in its own session; the runner commits them. The implementer, in another session, writes the code until they pass; the runner commits, pushes and opens the PR to main as the bot. A test the implementer calls wrong goes back to test-author with the reason.
+3. The review job in CI runs the reviewer agent, which writes a GitHub review, inline where it can.
+4. Findings or a red CI: the implementer fixes them in the same PR and the reviewer looks again; after 3 rounds the task goes to "Чака Йоан" with the question.
+5. Reviewer PASS and green CI: the runner merges.
+6. The runner writes the summary into the task (what was done, the PR, what the review caught, the cost). A task labelled `UI` goes to "Чака Йоан" for Yoan's check, the others to Done.
+
+A task labelled `invoicely-agents` is worked on in this repo, any other in `invoicely`. An exhausted Max limit is not a failure anywhere: the step waits and runs again after the reset.
 
 ## Layout
 
-- `agents/`: one definition per agent, written from `templates/agent.md`
-- `skills/`: domain skills (bg-vat, kontirane, ...)
-- `templates/`: `agent.md`, `brief.md` and `AUTHORING.md`
-- `evals/`: eval cases per agent, run with `claude plugin eval` (see `templates/AUTHORING.md`)
-- `fixtures/eval-workspace/`: the workspace every eval case starts from
-- `policies/role-guard.yaml`: the paths each agent may write; the role guard hook enforces it
-- `hooks/`: guards that run wherever the plugin is enabled. The role guard lets a subagent write only its paths from `policies/role-guard.yaml`: through Write and Edit it is stopped before the write, through Bash it cannot finish until it puts the files back (SubagentStop). Two subagents working at the same time in one working copy cannot be told apart, so agents that write code run in separate worktrees. The main guard stops a push to main, force push, `--no-verify`, merging or approving a PR and changes to branch protection, for agents and the main session alike. Tests: `node --test hooks/test/*.test.mjs`
+- `agents/`: `test-author`, `implementer`, `reviewer`, written from `templates/agent.md`
+- `factory/`: the runner (`node factory/factory.mjs`), its session prompts in `factory/prompts/`, its tests in `factory/test/`
+- `policies/role-guard.yaml`: what each agent may write. test-author writes tests only, the implementer everything but tests, the reviewer nothing; `fixtures/etalons/` is locked for all
+- `hooks/`: secret-guard (no agent reads secrets), role-guard and change-audit (the policy, by the runner's `INVOICELY_ROLE` or a subagent's type), main-guard (no push to main, force push, merge or approval by an agent), copy-guard (task copies are the runner's), action-log. The runner also checks every session's diff against the policy
+- `scripts/review-pr.mjs`: the review job; `scripts/run-evals.mjs` and `scripts/eval-cost.mjs`: evals by hand
+- `.github/workflows/ci.yml`: plugin validation and the hook and factory tests, a secret scan, and the review; `review.yml`: the shared review job, which `invoicely` calls too
+- `skills/bg-vat/`: the VAT return cells, for the reviewer
+- `evals/`, `fixtures/eval-workspace/`: eval cases per agent, run by hand (see `templates/AUTHORING.md`); CI does not run them
+- `templates/`: `agent.md` and `AUTHORING.md`
 
-- CI (`.github/workflows/ci.yml`): `claude plugin validate`, the hook tests and the factory tests on every PR; the evals of the changed agents when the `CLAUDE_CODE_OAUTH_TOKEN` secret is set, once per case on a PR into a feature branch and three times on a PR into main; the whole suite only by hand (workflow_dispatch). The evals run Claude on the Max plan; `scripts/eval-cost.mjs` adds their cost to the run summary
+## On the Mac
 
-- `factory/`: the runner for agent sessions on the Mac (`node factory/factory.mjs`). One queue, one session per task, a spending cap per run (`--max-budget-usd`), a night window (22:00 to 08:00) unless `--now`, automatic resume after the usage limit resets, a run ledger in `~/.invoicely/ledger/runs.jsonl` and a summary comment in Linear when `LINEAR_API_KEY` is in `~/.invoicely/.env`. The plugin loads from a separate copy (`plugin-runtime`), because Claude Code refuses edits to a loaded plugin's files. Tests: `node --test factory/test/*.test.mjs`
-- GitHub identity of the agents: the sessions commit, push and open PRs as `invoicely-agent-bot[bot]`, a GitHub App installed on `invoicely` and `invoicely-agents` (Contents and Pull requests write; Checks, Commit statuses and Actions read; no Workflows, no Administration). The runner needs `githubApp` (`appId`, `installationId`, `slug`, `botUserId`) in `~/.invoicely/config.json` and the key in `~/.invoicely/github-app.pem`; tokens live one hour and are renewed while a session runs (`factory/github-app.mjs`). Without them the sessions act as Yoan. Check on the Mac: `node factory/smoke-github-app.mjs`.
-- `.github/CODEOWNERS`: Yoan owns everything, so a PR from the bot needs his review.
-- Feature branches (INV-43): a feature (a parent task in Linear, such as INV-10) gets `feature/INV-10`, made from main. Its subtasks are queued with `--base feature/INV-10` and, when one needs another, `--depends-on INV-31,INV-32`. A subtask branch starts from the feature branch as it is then, its PR targets the feature branch, and the runner merges it there as the bot when CI is green (up to 2 fix sessions when it is red, then a "Чака Йоан" comment). A subtask starts only when its dependencies are merged, so there is no stack of PRs to rebase. Yoan tests the whole feature on staging and approves one PR, `feature/INV-10` to main. Branch rules: main needs a PR, green CI and Yoan's approval (he may bypass for his own PRs); `feature/**` needs a PR and green CI, no approval.
+- State in `~/.invoicely`: `queue.json`, `ledger/runs.jsonl`, `logs/`, `briefs/` (the task text the agents got), `plugin/` (the plugin's own copy at origin/main, because Claude Code refuses edits to a loaded plugin's files). Secrets: `.env` (Linear app), `github-app.pem`, `cache/`, `gh-bot/`.
+- `config.json`: `githubApp` (`appId`, `installationId`, `slug`, `botUserId`), optional `budgetUsd` (the cap per task, default 15) and `nodeBin`.
+- The service: `node factory/factory.mjs service install` (launchd, `com.invoicely.runner`, log in `~/.invoicely/logs/runner.log`). `factory status`, `factory pause [--wait]`, `factory resume`.
+- The sessions run in Claude Code's sandbox (`factory/sandbox.json`) with no GitHub identity; the runner pushes, opens PRs and merges as `invoicely-agent-bot[bot]`.
 
-## Rules
+## GitHub
 
-- Changes only through a PR: prompt-engineer writes, the evals pass, Yoan approves.
-- Agents working on the product never edit this repo.
-- Prompts are written in English; agents talk to Yoan in Bulgarian.
+- Both repos: main needs a PR and no approval. invoicely-agents requires "validate and hook tests" and "secret scan".
+- The review job needs the `CLAUDE_CODE_OAUTH_TOKEN` secret (the Max token) in each repo.
+- Changes to `.github/workflows` are pushed from Yoan's account: the bot has no Workflows permission.

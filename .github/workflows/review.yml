@@ -1,0 +1,43 @@
+# The review job (INV-64): the reviewer agent reads a PR into main with a fresh context and writes a GitHub review,
+# inline where it can. Shared: invoicely-agents calls it from its own CI, invoicely from a small workflow of its own.
+# The reviewer and its script are checked out from invoicely-agents' main into .agents, so a PR cannot change its own
+# review. An exhausted Max limit is not a failure: the check stays green and the runner runs the job again later.
+name: review
+
+on:
+  workflow_call:
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+
+jobs:
+  review:
+    name: review
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+      AGENTS_DIR: .agents
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: invoicely-organization/invoicely-agents
+          ref: main
+          path: .agents
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Claude Code
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Review
+        run: node .agents/scripts/review-pr.mjs "${{ github.event.pull_request.number }}" "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"

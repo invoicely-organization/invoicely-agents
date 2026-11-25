@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(~/.invoicely/.env)",
+      "Read(~/.invoicely/github-app.pem)",
+      "Read(~/.invoicely/cache/**)",
+      "Read(~/.invoicely/gh-bot/**)",
+      "Read(~/.invoicely/originals/**)"
+    ]
+  }
+}
