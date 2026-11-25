@@ -208,3 +208,47 @@ export function nightReport(entries, since, nightCap) {
   if (byTask.size === 0) lines.push('| - | нищо не е пускано | 0 | 0 | 0.00 | 0.00 | - |');
   return lines.join('\n');
 }
+
+// --- The runner as a launchd service (INV-49) ---
+
+const xml = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+// A LaunchAgent that keeps the runner going: at login, after a crash and after it exits for new code. caffeinate
+// keeps the Mac awake while the runner runs, as when it was started by hand.
+export function servicePlist({ label, node, script, cwd, logFile, pathEnv, home }) {
+  const args = ['/usr/bin/caffeinate', '-i', node, script, 'queue', 'run'].map((a) => `      <string>${xml(a)}</string>`).join('\n');
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>${xml(label)}</string>
+    <key>ProgramArguments</key>
+    <array>
+${args}
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${xml(cwd)}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>PATH</key>
+      <string>${xml(pathEnv)}</string>
+      <key>HOME</key>
+      <string>${xml(home)}</string>
+      <key>INVOICELY_SERVICE</key>
+      <string>1</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+    <key>StandardOutPath</key>
+    <string>${xml(logFile)}</string>
+    <key>StandardErrorPath</key>
+    <string>${xml(logFile)}</string>
+  </dict>
+</plist>
+`;
+}

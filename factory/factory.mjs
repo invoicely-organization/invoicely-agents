@@ -24,7 +24,7 @@ import { cleanupSummary, oldLogs, parseWorktrees, planCleanup } from './janitor.
 import {
   blockingDeps, checksVerdict, classify, failedChecks, fillTemplate, findPrUrl, fixMessage, inWindow, isFeatureBranch,
   entryCosts, minutesBetween, nextRunnable, nextWindowStart, nightReport, nightStart, parseLimitReset, parseResult,
-  sessionBudget, sessionDirName, spendingPeriod, spentSince, taskSpent,
+  servicePlist, sessionBudget, sessionDirName, spendingPeriod, spentSince, taskSpent,
 } from './lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -36,6 +36,9 @@ const config = {
   // the old folder keeps its copy there until it ends, because its session resumes by path.
   worktrees: path.join(HOME, 'projects/invoicely-agents/.claude/worktrees'),
   legacyWorktrees: path.join(HOME, 'projects/ia-wt'),
+  // The plugin loads from its own copy, outside the repo: Claude Code refuses edits to every file under a loaded
+  // plugin's folder, and the task copies live inside the repo (checked on 25.11, INV-49). It is runner state.
+  plugin: path.join(STATE, 'plugin'),
   pluginRef: 'origin/main',
   budgetUsd: 15, // API dollars a task's sessions may spend over all their runs; a task's own budgetUsd overrides it
   windowStart: 22,
@@ -49,6 +52,20 @@ const config = {
 const QUEUE = path.join(STATE, 'queue.json');
 const LEDGER = path.join(STATE, 'ledger', 'runs.jsonl');
 for (const dir of ['locks', 'ledger', 'logs']) fs.mkdirSync(path.join(STATE, dir), { recursive: true });
+
+// --- The runner as a service (INV-49) ---
+
+// While this file exists the runner starts nothing: no session, no CI merge, no clean-up. `factory pause` lets the
+// running session finish first, so that the copies can be worked on safely; `factory resume` goes on.
+const PAUSED = path.join(STATE, 'paused');
+// The runner runs from the main checkout, which stays on main and which nobody works in.
+const RUNS_FROM_REPO = path.resolve(path.dirname(HERE)) === path.resolve(config.repo);
+let startCommit = null;
+try {
+  startCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: path.dirname(HERE), stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+} catch {
+  // not a git checkout: no self-update
+}
 
 const ALLOWED_TOOLS = [
   'Agent', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
@@ -82,7 +99,7 @@ async function sleepUntil(when) {
 
 // The plugin loads from its own copy: Claude Code refuses edits to a loaded plugin's files.
 function ensureRuntime() {
-  const runtime = path.join(config.legacyWorktrees, 'plugin-runtime');
+  const runtime = config.plugin;
   if (!fs.existsSync(runtime)) {
     git(config.repo, ['fetch', '-q', 'origin']);
     git(config.repo, ['worktree', 'add', '-q', '--detach', runtime, config.pluginRef]);
@@ -349,14 +366,14 @@ async function runTask(task, budgetCap) {
       const message = task.message || 'You stopped before finishing (usage limit or interruption). Continue exactly where you stopped and finish the same instructions.';
       args = ['-p', `${message}\n\n${FOREGROUND}`, '--resume', task.resumeSession, ...base];
     } else {
+      // The session gets its id up front and the queue remembers it, so a run cut off by a restart or by the Mac
+      // turning off resumes the same session instead of starting over. Commits and PRs name it (INV-49).
+      newSession = crypto.randomUUID();
       const template = fs.readFileSync(path.join(HERE, 'prompts', 'prompt-engineer-task.md'), 'utf8');
       const prompt = fillTemplate(template, {
-        ISSUE: task.issue, BRANCH: task.branch, BRIEF: task.brief, WT: wt, BASE: prBase,
+        ISSUE: task.issue, BRANCH: task.branch, BRIEF: task.brief, WT: wt, BASE: prBase, SESSION: newSession,
         ANSWERS_LINE: task.answers ? ` Add the answers in ${task.answers} to the questions it asked earlier.` : '',
       });
-      // The session gets its id up front and the queue remembers it, so a run cut off by a restart or by the Mac
-      // turning off resumes the same session instead of starting over.
-      newSession = crypto.randomUUID();
       args = ['-p', prompt, '--session-id', newSession, ...base];
     }
     const started = new Date();
@@ -792,11 +809,72 @@ async function maybeCleanup() {
   const today = now.toLocaleDateString('sv-SE');
   if (readJson(stateFile, {}).lastRun === today) return;
   if (fs.readdirSync(path.join(STATE, 'locks')).length > 0) return;
+  retireOldCopies();
   const result = await cleanup();
   const state = readJson(stateFile, {});
   state.lastRun = today;
   if (result) state.summary = { day: today, text: cleanupSummary(result.plan, result.done) };
   fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+}
+
+// Before each round: the main checkout follows origin/main, so that merged changes to the runner and the agents take
+// effect. It is fast-forwarded only when it is on main with no changes to tracked files. When the runner's own code
+// changed, a runner under launchd exits and launchd starts it again with the new code.
+function updateRunnerCode() {
+  if (!RUNS_FROM_REPO || !startCommit) return;
+  try {
+    const branch = git(config.repo, ['symbolic-ref', '--short', 'HEAD']);
+    const dirty = git(config.repo, ['status', '--porcelain', '--untracked-files=no']) !== '';
+    if (branch !== 'main' || dirty) {
+      logOnce(`repo:${branch}:${dirty}`, `the main checkout is ${dirty ? 'changed' : `on ${branch}`}; it is not updated until it is clean main again`);
+      return;
+    }
+    git(config.repo, ['fetch', '-q', 'origin']);
+    git(config.repo, ['merge', '-q', '--ff-only', 'origin/main']);
+    if (git(config.repo, ['diff', '--name-only', startCommit, 'HEAD', '--', 'factory/']) === '') return;
+    if (process.env.INVOICELY_SERVICE === '1') {
+      log('the runner code changed in main; exiting so that launchd starts the new code');
+      process.exit(0);
+    }
+    logOnce(`code:${git(config.repo, ['rev-parse', 'HEAD'])}`, 'the runner code changed in main; restart the runner to use it');
+  } catch (error) {
+    log(`update: ${error.message.split('\n')[0]}`);
+  }
+}
+
+// The two copies the runner needed before INV-49 go once it runs from the repo: the plugin's old copy and the
+// runner's old copy in ~/projects/ia-wt. Only when clean, and the runner's old copy only once the bot tools no
+// longer load code from it. The old folder goes when it is empty. The copy guard stops removing them by hand.
+function retireOldCopies() {
+  if (!RUNS_FROM_REPO) return;
+  const tools = path.join(STATE, 'tools');
+  const usedByTools = (dir) => fs.existsSync(tools) && fs.readdirSync(tools).some((f) => f.endsWith('.mjs') && fs.readFileSync(path.join(tools, f), 'utf8').includes(dir));
+  for (const name of ['plugin-runtime', 'factory-runner']) {
+    const old = path.join(config.legacyWorktrees, name);
+    if (!fs.existsSync(old)) continue;
+    if (usedByTools(old)) {
+      logOnce(`tools:${old}`, `kept ${old}: a bot tool in ${tools} still loads code from it`);
+      continue;
+    }
+    try {
+      if (git(old, ['status', '--porcelain']) !== '') {
+        logOnce(`changed:${old}`, `kept ${old}: it has changes`);
+        continue;
+      }
+      git(config.repo, ['worktree', 'remove', old]);
+      log(`removed ${old}: the runner runs from ${config.repo}, the plugin loads from ${config.plugin}`);
+    } catch (error) {
+      log(`${old}: ${error.message.split('\n')[0]}`);
+    }
+  }
+  try {
+    if (fs.existsSync(config.legacyWorktrees) && fs.readdirSync(config.legacyWorktrees).every((f) => f === '.DS_Store')) {
+      fs.rmSync(config.legacyWorktrees, { recursive: true });
+      log(`removed the empty ${config.legacyWorktrees}`);
+    }
+  } catch (error) {
+    log(`${config.legacyWorktrees}: ${error.message}`);
+  }
 }
 
 // The same line every 5 minutes says nothing new: a state is logged once.
@@ -822,7 +900,14 @@ async function stopOverBudget(task, spent, cap) {
 }
 
 async function runQueue(now) {
+  retireOldCopies();
   for (;;) {
+    if (fs.existsSync(PAUSED)) {
+      logOnce(`paused:${fs.statSync(PAUSED).mtimeMs}`, 'paused: no sessions, CI merges or clean-up until `factory resume`');
+      await sleep(60 * 1000);
+      continue;
+    }
+    updateRunnerCode();
     await syncFromLinear();
     await processCi();
     await maybeCleanup();
@@ -894,6 +979,40 @@ async function runQueue(now) {
   }
 }
 
+// The runner as a launchd service: starts at login, starts again when it stops (a crash, or new code in main),
+// logs to runner.log. Install it once, after the manual runner is stopped.
+const LABEL = 'com.invoicely.runner';
+function service(sub) {
+  const plistFile = path.join(HOME, 'Library', 'LaunchAgents', `${LABEL}.plist`);
+  const domain = `gui/${process.getuid()}`;
+  if (sub === 'install') {
+    if (!RUNS_FROM_REPO) return console.log(`install the service from the main checkout: node ${path.join(config.repo, 'factory', 'factory.mjs')} service install`);
+    const nodeBin = config.nodeBin || path.dirname(process.execPath);
+    fs.mkdirSync(path.dirname(plistFile), { recursive: true });
+    fs.writeFileSync(plistFile, servicePlist({
+      label: LABEL, node: path.join(nodeBin, 'node'), script: path.join(config.repo, 'factory', 'factory.mjs'), cwd: config.repo,
+      logFile: path.join(STATE, 'logs', 'runner.log'), pathEnv: `${nodeBin}:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`, home: HOME,
+    }));
+    execFileSync('launchctl', ['bootstrap', domain, plistFile], { stdio: 'inherit' });
+    return console.log(`installed ${plistFile}; the runner runs as ${LABEL}`);
+  }
+  if (sub === 'uninstall') {
+    try {
+      execFileSync('launchctl', ['bootout', `${domain}/${LABEL}`], { stdio: 'inherit' });
+    } catch {
+      // not loaded
+    }
+    fs.rmSync(plistFile, { force: true });
+    return console.log(`uninstalled ${LABEL}`);
+  }
+  try {
+    const out = execFileSync('launchctl', ['print', `${domain}/${LABEL}`], { stdio: ['ignore', 'pipe', 'ignore'] }).toString();
+    return console.log(out.split('\n').filter((l) => /state =|pid =|last exit code/.test(l)).map((l) => l.trim()).join('\n'));
+  } catch {
+    return console.log(`${LABEL} is not installed (factory service install)`);
+  }
+}
+
 async function main() {
   const [command, sub, ...rest] = process.argv.slice(2);
   if (command === 'queue' && sub === 'add') {
@@ -903,6 +1022,45 @@ async function main() {
     return log(`queued ${rest[0]} (${queue.length} in queue)`);
   }
   if (command === 'queue' && sub === 'run') return runQueue(rest.includes('--now'));
+  if (command === 'pause') {
+    fs.writeFileSync(PAUSED, `${new Date().toISOString()}\n`);
+    console.log('paused: the runner finishes the session that runs now and then starts nothing until `factory resume`');
+    if (sub === '--wait' || rest.includes('--wait')) {
+      while (fs.readdirSync(path.join(STATE, 'locks')).length > 0) {
+        console.log(`waiting for ${fs.readdirSync(path.join(STATE, 'locks')).join(', ')} to finish`);
+        await sleep(60 * 1000);
+      }
+      console.log('no session runs: the copies may be worked on');
+    }
+    return undefined;
+  }
+  if (command === 'resume') {
+    fs.rmSync(PAUSED, { force: true });
+    return console.log('resumed');
+  }
+  // Puts a task back from the ledger, instead of editing queue.json by hand: --ci to wait for its PR's CI and merge
+  // it when green, otherwise to resume its session (with --message <text>).
+  if (command === 'requeue') {
+    const issue = sub;
+    const entries = readLedger().filter((e) => e.issue === issue);
+    const last = [...entries].reverse().find((e) => e.branch);
+    if (!issue || !last) return console.log(`usage: factory requeue <INV-xx> [--ci | --message <text>]; no run of ${issue ?? '?'} in the ledger`);
+    if (readJson(QUEUE, []).some((t) => t.issue === issue)) return console.log(`${issue} is already in the queue`);
+    const session = [...entries].reverse().find((e) => e.session)?.session;
+    const pr = [...entries].reverse().find((e) => e.pr)?.pr;
+    const worktree = [...entries].reverse().find((e) => e.worktree)?.worktree;
+    const at = rest.indexOf('--message');
+    const item = rest.includes('--ci')
+      ? { issue, branch: last.branch, base: last.base, stage: 'ci', pr, session, ciSince: new Date().toISOString(), fixRounds: 1, worktree }
+      : { issue, branch: last.branch, base: last.base, resumeSession: session, pr, worktree, message: at >= 0 ? rest[at + 1] : undefined };
+    if (item.stage === 'ci' && !pr) return console.log(`${issue} has no PR in the ledger`);
+    for (const key of Object.keys(item)) if (item[key] === undefined) delete item[key];
+    const queue = readJson(QUEUE, []);
+    queue.unshift(item);
+    fs.writeFileSync(QUEUE, JSON.stringify(queue, null, 2));
+    return log(`requeued ${issue}${item.stage === 'ci' ? ` to wait for CI on ${pr}` : ''}`);
+  }
+  if (command === 'service') return service(sub);
   if (command === 'clean') {
     const dryRun = sub === '--dry-run' || rest.includes('--dry-run');
     const result = await cleanup({ dryRun });
@@ -934,7 +1092,7 @@ async function main() {
     });
     return undefined;
   }
-  console.log('usage: factory queue add <INV-xx> --branch <b> --brief <file> [...] | factory queue run [--now] | factory run <INV-xx> ... | factory status | factory clean [--dry-run]');
+  console.log('usage: factory queue add <INV-xx> --branch <b> --brief <file> [...] | factory queue run [--now] | factory run <INV-xx> ... | factory status | factory clean [--dry-run] | factory pause [--wait] | factory resume | factory requeue <INV-xx> [--ci | --message <text>] | factory service install|uninstall|status');
   return undefined;
 }
 
