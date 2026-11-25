@@ -26,15 +26,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { decideWrite, loadPolicy } from '../hooks/lib/policy.mjs';
+import { mergeInProgress, policyViolations, unmergedFiles } from './git-check.mjs';
 import { appSettings, installationToken, sessionEnv, writeGhConfig } from './github-app.mjs';
 import { cleanupSummary, oldLogs, parseWorktrees, planCleanup } from './janitor.mjs';
 import { linearClient, mention } from './linear.mjs';
 import { answerAfter, planFromReady } from './linear-sync.mjs';
 import {
-  budgetAnswer, checksVerdict, classify, entryCosts, failedChecks, fillTemplate, findingLines, fixMessage, isReviewCheck,
-  minutesBetween, nextRunnable, parseOutcome, parseResult, retryAt, reviewOfHead, reviewText, servicePlist, sessionDirName,
-  statusAction, summaryBody, taskCost,
+  budgetAnswer, classify, entryCosts, fillTemplate, findingLines, fixMessage, isReviewCheck, minutesBetween, nextRunnable,
+  parseOutcome, parseResult, retryAt, reviewDecision, reviewText, servicePlist, statusAction, summaryBody, taskCost,
 } from './lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -63,6 +62,8 @@ for (const dir of ['locks', 'ledger', 'logs', 'briefs']) fs.mkdirSync(path.join(
 
 const MAX_ROUNDS = 3; // review rounds before the task goes to Yoan
 const MAX_DISPUTES = 2; // times a test may go back to test-author before Yoan decides
+const MAX_LIMIT_WAITS = 8; // limit resets waited for in a row before Yoan is told ("Credit balance is too low" may not reset)
+const MAX_REVIEW_ERRORS = 5; // rounds in a row in which GitHub or git failed on a PR before Yoan is told
 const REVIEW_TIMEOUT_MINUTES = 150;
 
 // The runner runs from the main checkout of invoicely-agents, which stays on main and which nobody works in.
@@ -74,11 +75,10 @@ try {
   // not a git checkout: no self-update
 }
 
-// What the sessions may run. They do not commit, push or open PRs: the runner does, as the bot.
+// What the sessions may run. They do not commit, merge, push or open PRs: the runner does, as the bot.
 const COMMON_TOOLS = [
   'Agent', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
-  'Bash(git status:*)', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git show:*)', 'Bash(git fetch:*)', 'Bash(git merge:*)',
-  'Bash(ls:*)', 'Bash(mkdir:*)',
+  'Bash(git status:*)', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git show:*)', 'Bash(ls:*)', 'Bash(mkdir:*)',
 ];
 const REPO_TOOLS = {
   // The * form: on 25.11 `Bash(node scripts/:*)` refused `node scripts/x.mjs`, `Bash(node scripts/*)` allowed it.
@@ -218,51 +218,23 @@ async function gh(args, { asBot = false, json = false, cwd = AGENTS_REPO } = {})
 
 // --- The role guard after every session ---
 
-// The files a session changed: against the commit it started from, plus new files. When main was merged into the
-// copy meanwhile (a conflict the implementer resolves), a file that is now as it is in main came from main.
-function touchedFiles(wt, before) {
-  const files = new Set([...gitZ(wt, ['diff', '--name-only', '-z', before]), ...gitZ(wt, ['ls-files', '--others', '--exclude-standard', '-z'])]);
-  const gitDir = git(wt, ['rev-parse', '--git-dir']);
-  const ancestor = (a, b) => {
-    try {
-      git(wt, ['merge-base', '--is-ancestor', a, b]);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-  const merging = fs.existsSync(path.resolve(wt, gitDir, 'MERGE_HEAD')) || (ancestor('origin/main', 'HEAD') && !ancestor('origin/main', before));
-  if (!merging) return [...files];
-  const blob = (ref, file) => {
-    try {
-      return git(wt, ['rev-parse', `${ref}:${file}`]);
-    } catch {
-      return 'deleted';
-    }
-  };
-  const working = (file) => (fs.existsSync(path.join(wt, file)) ? git(wt, ['hash-object', '--', file]) : 'deleted');
-  return [...files].filter((file) => blob('origin/main', file) !== working(file));
-}
-
-function guardViolations(wt, before, role) {
-  const policy = loadPolicy(path.join(ensureRuntime(), 'policies', 'role-guard.yaml'));
-  return touchedFiles(wt, before).map((file) => decideWrite(policy, role, file)).filter((d) => !d.allowed).map((d) => d.reason);
-}
+// The runner's own git never runs hooks: nothing a session wrote may run with the bot's token.
+const NO_HOOKS = ['-c', 'core.hooksPath=/dev/null'];
 
 // Commits everything in the copy as the bot; finishes a merge of main when one is in progress. Returns true when
-// there was something to commit.
+// there was something to commit. The caller checks for unresolved conflicts first.
 async function commitAll(wt, message) {
   const env = await botEnv();
   git(wt, ['add', '-A'], env);
-  const gitDir = git(wt, ['rev-parse', '--git-dir']);
-  const merging = fs.existsSync(path.resolve(wt, gitDir, 'MERGE_HEAD'));
+  const merging = mergeInProgress(wt);
   if (!merging && git(wt, ['diff', '--cached', '--name-only']) === '') return false;
-  git(wt, merging ? ['commit', '-q', '--no-edit'] : ['commit', '-q', '-m', message], env);
+  git(wt, [...NO_HOOKS, 'commit', '-q', ...(merging ? ['--no-edit'] : ['-m', message])], env);
   return true;
 }
 
 async function push(task, wt) {
-  git(wt, ['push', '-q', '-u', 'origin', `HEAD:refs/heads/${task.branch}`], await botEnv());
+  git(wt, [...NO_HOOKS, 'push', '-q', '-u', 'origin', `HEAD:refs/heads/${task.branch}`], await botEnv());
+  return git(wt, ['rev-parse', 'HEAD']);
 }
 
 // --- Sessions ---
@@ -296,17 +268,6 @@ function lock(issue) {
   }
   fs.writeFileSync(file, JSON.stringify({ pid: process.pid, since: new Date().toISOString() }));
   return () => fs.rmSync(file, { force: true });
-}
-
-function latestSession(cwd) {
-  const dir = path.join(HOME, '.claude', 'projects', sessionDirName(cwd));
-  try {
-    const files = fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl'))
-      .map((f) => ({ f, t: fs.statSync(path.join(dir, f)).mtimeMs })).sort((a, b) => b.t - a.t);
-    return files.length ? files[0].f.replace(/\.jsonl$/, '') : null;
-  } catch {
-    return null;
-  }
 }
 
 function runClaude(args, cwd, logFile, role) {
@@ -343,11 +304,12 @@ async function runSession(task, role, wt, budget) {
   const base = ['--agent', `invoicely-agents:${role}`, '--plugin-dir', runtime, '--settings', SANDBOX, '--permission-mode', 'acceptEdits',
     '--output-format', 'json', '--max-budget-usd', String(budget), '--allowedTools', ...COMMON_TOOLS, ...(REPO_TOOLS[task.repo] ?? [])];
   let args;
-  if (sessions[role]) {
-    args = ['-p', task.message || CONTINUE, '--resume', sessions[role], ...base];
+  let id = sessions[role];
+  if (id) {
+    args = ['-p', task.message || CONTINUE, '--resume', id, ...base];
   } else {
     // The session gets its id up front and the queue remembers it, so a run cut off by a restart resumes it.
-    const id = crypto.randomUUID();
+    id = crypto.randomUUID();
     const prompt = fillTemplate(fs.readFileSync(path.join(HERE, 'prompts', `${role}.md`), 'utf8'), {
       ISSUE: task.issue, TASK: fs.readFileSync(task.brief, 'utf8').trim(), WT: wt, REPO: task.repo, BRANCH: task.branch, TESTS: testsLine(task),
     });
@@ -363,7 +325,7 @@ async function runSession(task, role, wt, budget) {
   const result = parseResult(stdout);
   const status = classify(result);
   const ended = new Date();
-  const session = result.sessionId || sessions[role] || latestSession(wt);
+  const session = result.sessionId || id;
   const runCost = result.costUsd == null ? null : entryCosts([...readLedger(), { session, sessionCostUsd: result.costUsd }]).at(-1);
   ledger({
     issue: task.issue, role, stage: task.stage, branch: task.branch, session, started: started.toISOString(), ended: ended.toISOString(),
@@ -376,12 +338,23 @@ async function runSession(task, role, wt, budget) {
 // Limit, error and question are the same for both roles. Returns true when the step ends here.
 async function settleSession(task, role, r) {
   if (r.status === 'limit') {
+    const waits = (task.limitWaits ?? 0) + 1;
+    if (waits > MAX_LIMIT_WAITS) {
+      await askYoan(task, {
+        kind: 'error', role,
+        what: `лимитът на Max не се поднови след ${MAX_LIMIT_WAITS} изчаквания.`,
+        todo: 'виж съобщението по-долу (може да е плащане или настройка, не лимит) и пиши тук "опитай пак", когато е наред.',
+        ifNot: 'задачата стои.', details: r.text.slice(0, 1500),
+      });
+      return true;
+    }
     const until = retryAt(r.text);
     limitUntil = Math.max(limitUntil, until.getTime());
-    updateItem(task.issue, { waitUntil: until.toISOString(), message: CONTINUE, sessions: { ...(task.sessions ?? {}), [role]: r.session } });
+    updateItem(task.issue, { waitUntil: until.toISOString(), limitWaits: waits, message: CONTINUE, sessions: { ...(task.sessions ?? {}), [role]: r.session } });
     log(`${task.issue}: ${role} stopped by the Max limit; again at ${until.toString()}`);
     return true;
   }
+  updateItem(task.issue, { limitWaits: undefined, waitUntil: undefined });
   if (r.status === 'error') {
     await askYoan(task, {
       kind: 'error', role,
@@ -435,11 +408,11 @@ async function stepTests(task) {
   const violations = guardViolations(wt, before, 'test-author');
   if (violations.length) return guardFailed(task, 'test-author', violations);
   const dispute = task.stage === 'tests-fix';
+  // Committed here and pushed with the code: a PR never shows the implementer's work half done.
   const changed = await commitAll(wt, dispute ? `${task.issue}: tests, after the implementer's report` : `${task.issue}: tests from the task's criteria`);
-  const next = { stage: dispute ? task.afterDispute : 'code', guardRetry: undefined, waitUntil: undefined, afterDispute: undefined };
+  const next = { stage: dispute ? (task.afterDispute ?? 'code') : 'code', guardRetry: undefined, waitUntil: undefined, afterDispute: undefined };
   if (changed) {
-    await push(task, wt);
-    const files = gitZ(wt, ['diff', '--name-only', '-z', `${before}..HEAD`]);
+    const files = gitZ(wt, ['diff', '--no-renames', '--name-only', '-z', `${before}..HEAD`]);
     Object.assign(next, { testsCommit: git(wt, ['rev-parse', 'HEAD']), testFiles: [...new Set([...(task.testFiles ?? []), ...files])] });
   }
   if (!dispute) next.testReport = r.report;
@@ -457,13 +430,17 @@ async function stepCode(task) {
   const r = await runSession(task, 'implementer', wt, await budgetFor(task));
   if (await settleSession(task, 'implementer', r)) return;
   const violations = guardViolations(wt, before, 'implementer');
+  const unresolved = unmergedFiles(wt);
+  if (unresolved.length) violations.push(`the merge of main still has conflicts in ${unresolved.join(', ')}`);
   if (violations.length) return guardFailed(task, 'implementer', violations);
   if (r.status === 'test_wrong') {
     // The implementer's work so far is kept in a commit, so that test-author's diff is only its own.
     await commitAll(wt, `${task.issue}: work in progress, before test-author's answer`);
     const disputes = (task.disputes ?? 0) + 1;
+    const toTestAuthor = `The implementer says a test is wrong:\n\n${r.report}\n\nCheck it against the task. If the implementer is right, fix the test and end with RESULT: DONE. If the test is right, leave it and explain why for the implementer, ending with RESULT: KEEP.`;
     if (disputes > MAX_DISPUTES) {
-      updateItem(task.issue, { disputes: 0 });
+      // Yoan's answer goes to test-author with the implementer's report, then back to the implementer.
+      updateItem(task.issue, { disputes: 0, stage: 'tests-fix', afterDispute: task.stage, message: toTestAuthor });
       await askYoan(task, {
         kind: 'dispute', role: 'test-author',
         what: `test-author и implementer не са съгласни за тест, вече ${MAX_DISPUTES} пъти.`,
@@ -473,16 +450,12 @@ async function stepCode(task) {
       });
       return;
     }
-    updateItem(task.issue, {
-      stage: 'tests-fix', afterDispute: task.stage, disputes, guardRetry: undefined,
-      message: `The implementer says a test is wrong:\n\n${r.report}\n\nCheck it against the task. If the implementer is right, fix the test and end with RESULT: DONE. If the test is right, leave it and explain why for the implementer, ending with RESULT: KEEP.`,
-    });
+    updateItem(task.issue, { stage: 'tests-fix', afterDispute: task.stage, disputes, guardRetry: undefined, message: toTestAuthor });
     log(`${task.issue}: the implementer calls a test wrong; back to test-author (${disputes}/${MAX_DISPUTES})`);
     return;
   }
   const round = task.round ?? 0;
   await commitAll(wt, task.stage === 'fix' ? `${task.issue}: fix round ${round}` : `${task.issue}: ${task.title}`);
-  const sameHead = git(wt, ['rev-parse', 'HEAD']) === before;
   if (git(wt, ['rev-list', '--count', 'origin/main..HEAD']) === '0') {
     await askYoan(task, {
       kind: 'question', role: 'implementer', what: 'implementer свърши без нито една промяна, така че няма PR.',
@@ -491,16 +464,28 @@ async function stepCode(task) {
     });
     return;
   }
-  await push(task, wt);
-  let { pr } = task;
-  if (!pr) pr = await openPr(task, r.report);
+  updateItem(task.issue, { stage: 'publish', message: undefined, guardRetry: undefined, ...(task.stage === 'code' ? { report: r.report } : {}) });
+  await publish(readQueue().find((t) => t.issue === task.issue));
+}
+
+// Push and PR, apart from the session: when GitHub fails here, the runner tries again without a new session.
+async function publish(task) {
+  const wt = ensureWorktree(task);
+  const sha = await push(task, wt);
+  const pr = task.pr ?? (await existingPr(task)) ?? (await openPr(task, task.report));
   updateItem(task.issue, {
-    stage: 'review', pr, reviewSince: new Date().toISOString(), message: undefined, guardRetry: undefined, waitUntil: undefined,
-    // No new commit (the implementer changed nothing after an answer or a finding): the review job runs again itself.
-    needsReviewRerun: task.pr && sameHead ? true : undefined,
-    ...(task.stage === 'code' ? { report: r.report } : {}),
+    stage: 'review', pr, pushedSha: sha, reviewSince: new Date().toISOString(), reviewReruns: undefined, rerunAt: undefined,
+    // No new commit since the last review (the implementer changed nothing after an answer or a finding): the review
+    // job runs again on the same head, with Yoan's answer in the PR description.
+    needsReviewRerun: task.pr && sha === task.pushedSha ? true : undefined,
   });
-  log(`${task.issue}: pushed; the reviewer reads ${pr}`);
+  log(`${task.issue}: pushed ${sha.slice(0, 10)}; the reviewer reads ${pr}`);
+}
+
+async function existingPr(task) {
+  const slug = repoSlug(repoDir(task));
+  const open = await gh(['pr', 'list', '--repo', slug, '--head', task.branch, '--state', 'open', '--json', 'url'], { json: true, cwd: repoDir(task) });
+  return open[0]?.url ?? null;
 }
 
 // The PR's description is the task itself (the reviewer's brief) and the implementer's summary.
@@ -516,7 +501,9 @@ async function openPr(task, report) {
   try {
     const slug = repoSlug(repoDir(task));
     const out = await gh(['pr', 'create', '--repo', slug, '--base', 'main', '--head', task.branch, '--title', `${task.issue}: ${task.title}`, '--body-file', file], { asBot: true, cwd: repoDir(task) });
-    return /https:\/\/github\.com\/\S+\/pull\/\d+/.exec(out)?.[0] ?? out;
+    const url = /https:\/\/github\.com\/\S+\/pull\/\d+/.exec(out)?.[0];
+    if (!url) throw new Error(`gh pr create gave no PR URL: ${out.slice(0, 200)}`);
+    return url;
   } finally {
     fs.rmSync(file, { force: true });
   }
@@ -537,7 +524,7 @@ async function rerunReview(task, check) {
   return true;
 }
 
-async function fixRound(task, { review = null, failed = [], conflict = false }) {
+async function fixRound(task, { review = null, failed = [], conflict = null }) {
   const round = (task.round ?? 0) + 1;
   if (round > MAX_ROUNDS) {
     await askYoan(task, {
@@ -545,52 +532,60 @@ async function fixRound(task, { review = null, failed = [], conflict = false }) 
       what: `ревюто или CI на ${task.pr} не минават след ${MAX_ROUNDS} кръга поправки.`,
       todo: 'прочети последните забележки по-долу и пиши тук как да продължи implementer. Предложение: кажи коя забележка е по-важна или "поемам", ако го поемаш ти.',
       ifNot: 'PR-ът остава отворен и не се слива.',
-      details: [review, failed.length ? `Червени проверки: ${failed.join(', ')}` : ''].filter(Boolean).join('\n\n').slice(0, 3000),
+      details: [review, failed.length ? `Червени проверки: ${failed.join(', ')}` : '', conflict ? `Конфликт с main в: ${conflict.join(', ')}` : ''].filter(Boolean).join('\n\n').slice(0, 3000),
     });
     return;
   }
-  updateItem(task.issue, { stage: 'fix', round, message: fixMessage({ round, maxRounds: MAX_ROUNDS, review, failed, conflict }), reviewReruns: undefined, waitUntil: undefined });
-  log(`${task.issue}: fix round ${round}${review ? ' (review)' : ''}${failed.length ? ` (${failed.join(', ')})` : ''}${conflict ? ' (conflict)' : ''}`);
+  updateItem(task.issue, { stage: 'fix', round, message: fixMessage({ round, maxRounds: MAX_ROUNDS, review, failed, conflict }), reviewReruns: undefined, waitUntil: undefined, limitWaits: undefined });
+  log(`${task.issue}: fix round ${round}${review ? ' (review)' : ''}${failed.length ? ` (${failed.join(', ')})` : ''}${conflict ? ' (conflict with main)' : ''}`);
 }
 
-// A conflict with main is the runner's when git can merge it alone; otherwise the implementer gets a fix round.
+// main moved on and the PR conflicts with it: the runner merges main into the copy. A clean merge is pushed; otherwise
+// the merge stays open with git's conflict markers and the implementer resolves them in a fix round.
 async function mergeMain(task) {
   const wt = ensureWorktree(task);
   const env = await botEnv();
   git(wt, ['fetch', '-q', 'origin'], env);
   try {
-    git(wt, ['merge', '-q', '--no-edit', 'origin/main'], env);
+    git(wt, [...NO_HOOKS, 'merge', '-q', '--no-edit', 'origin/main'], env);
   } catch {
-    try {
-      git(wt, ['merge', '--abort']);
-    } catch {
-      // nothing to abort
-    }
-    return false;
+    const conflicts = unmergedFiles(wt);
+    if (conflicts.length) return { conflicts };
+    throw new Error('git merge origin/main failed without conflicts');
   }
-  await push(task, wt);
-  return true;
+  const sha = await push(task, wt);
+  updateItem(task.issue, { pushedSha: sha, reviewSince: new Date().toISOString() });
+  return { merged: true };
 }
 
-const recorded = new Set();
 function recordReview(task, review) {
-  const key = `${task.issue}:${review.id}`;
-  if (recorded.has(key) || readLedger().some((e) => e.status === 'review' && e.reviewId === review.id)) return;
-  recorded.add(key);
-  const text = reviewText(review.body);
+  if (readLedger().some((e) => e.status === 'review' && e.reviewId === review.id)) return;
   ledger({
     issue: task.issue, status: 'review', reviewId: review.id, round: task.round ?? 0, verdict: review.marker.verdict,
-    sha: review.marker.sha, costUsd: review.marker.costUsd, pr: task.pr, findings: findingLines(text).slice(0, 10),
+    sha: review.marker.sha, costUsd: review.marker.costUsd, pr: task.pr, findings: findingLines(reviewText(review.body)).slice(0, 10),
   });
 }
 
-// One look at every PR that waits for its review. Needs no session, so it runs between sessions at any hour.
+// One look at every PR that waits for its review. Needs no session, so it runs between sessions. A PR on which GitHub
+// or git keeps failing is not left to wait forever: after a few rounds Yoan is told.
 async function processReviews() {
   for (const task of readQueue().filter((t) => t.stage === 'review')) {
     try {
       await processReview(task);
+      if (task.reviewErrors) updateItem(task.issue, { reviewErrors: undefined });
     } catch (error) {
-      logOnce(`review:${task.issue}:${error.message.slice(0, 80)}`, `${task.issue}: review: ${error.message.split('\n')[0]}`);
+      const errors = (task.reviewErrors ?? 0) + 1;
+      log(`${task.issue}: review step failed (${errors}/${MAX_REVIEW_ERRORS}): ${error.message.split('\n')[0]}`);
+      if (errors < MAX_REVIEW_ERRORS) {
+        updateItem(task.issue, { reviewErrors: errors });
+        continue;
+      }
+      updateItem(task.issue, { reviewErrors: undefined });
+      await askYoan(task, {
+        kind: 'review_stuck', role: 'reviewer', what: `runner-ът не може да продължи с ${task.pr}: GitHub или git отказват ${MAX_REVIEW_ERRORS} пъти подред.`,
+        todo: 'виж грешката по-долу и пиши тук "опитай пак", когато е наред. Предложение: "опитай пак".', ifNot: 'PR-ът стои и не се слива.',
+        details: error.message.slice(0, 1500),
+      });
     }
   }
 }
@@ -599,93 +594,64 @@ async function processReview(task) {
   const cwd = repoDir(task);
   const slug = repoSlug(cwd);
   const view = await gh(['pr', 'view', task.pr, '--json', 'number,state,headRefOid,mergeable'], { json: true, cwd });
-  if (view.state === 'MERGED') return finish(task);
-  if (view.state === 'CLOSED') {
-    ledger({ issue: task.issue, status: 'closed', pr: task.pr });
-    updateItem(task.issue, null);
-    await comment(task.issue, `**Спряно.** PR-ът ${task.pr} е затворен, затова runner-ът извади задачата от опашката. Върни я в Ready, за да започне отначало.`);
-    return undefined;
-  }
-  if (view.mergeable === 'CONFLICTING') {
-    if (await mergeMain(task)) {
-      log(`${task.issue}: merged main into the PR itself; the reviewer looks again`);
-      updateItem(task.issue, { reviewSince: new Date().toISOString() });
-      return undefined;
-    }
-    return fixRound(task, { conflict: true });
-  }
-  let checks = [];
+  let checks = null;
   try {
     checks = await gh(['pr', 'checks', task.pr, '--json', 'name,bucket,link'], { json: true, cwd });
   } catch {
-    // no checks reported yet
-  }
-  const reviewCheck = checks.find((c) => isReviewCheck(c.name));
-  if (task.needsReviewRerun) {
-    if (reviewCheck?.bucket === 'pending') return undefined;
-    if (await rerunReview(task, reviewCheck)) {
-      updateItem(task.issue, { needsReviewRerun: undefined, rerunAt: new Date().toISOString(), reviewSince: new Date().toISOString() });
-      log(`${task.issue}: no new commit, so the review runs again on the same head`);
-      return undefined;
-    }
-    updateItem(task.issue, { needsReviewRerun: undefined });
+    // no checks reported yet, or GitHub did not answer: the decision waits
   }
   const reviews = await gh(['api', `repos/${slug}/pulls/${view.number}/reviews?per_page=100`], { json: true, cwd });
-  const review = reviewOfHead(reviews, view.headRefOid);
-  // A red CI is fixed first: the review job waits for the checks and does not run on a red build.
-  if (!review && checksVerdict(checks) === 'fail') return fixRound(task, { failed: failedChecks(checks) });
-  const now = Date.now();
-  const recentlyRerun = task.rerunAt && now - Date.parse(task.rerunAt) < 10 * 60 * 1000;
-  if (!review || reviewCheck?.bucket === 'pending' || recentlyRerun) {
-    if (reviewCheck?.bucket === 'pending' || recentlyRerun || !reviewCheck) {
-      if (minutesBetween(new Date(task.reviewSince), new Date()) < REVIEW_TIMEOUT_MINUTES) return undefined;
-    }
-    // The job ended without a review (it crashed) or never came: once again, then Yoan.
-    if (!task.reviewReruns && (await rerunReview(task, reviewCheck))) {
-      updateItem(task.issue, { reviewReruns: 1, rerunAt: new Date().toISOString(), reviewSince: new Date().toISOString() });
-      log(`${task.issue}: the review job left no review; it runs once more`);
+  const d = reviewDecision({ task, view, checks, reviews, limitUntil, timeoutMinutes: REVIEW_TIMEOUT_MINUTES, maxLimitWaits: MAX_LIMIT_WAITS });
+  if (d.reviewEntry) recordReview(task, d.reviewEntry);
+  const reviewCheck = checks?.find((c) => isReviewCheck(c.name));
+  switch (d.action) {
+    case 'wait':
+      return undefined;
+    case 'finish':
+      return finish(task);
+    case 'closed':
+      ledger({ issue: task.issue, status: 'closed', pr: task.pr });
+      updateItem(task.issue, null);
+      await comment(task.issue, `**Спряно.** PR-ът ${task.pr} е затворен, затова runner-ът извади задачата от опашката. Върни я в Ready, за да започне отначало на нов клон.`);
+      return undefined;
+    case 'merge-main': {
+      const merged = await mergeMain(task);
+      if (merged.merged) log(`${task.issue}: merged main into the PR itself; the reviewer looks again`);
+      else await fixRound(task, { conflict: merged.conflicts });
       return undefined;
     }
-    return askYoan(task, {
-      kind: 'review_stuck', role: 'reviewer', what: `ревюто на ${task.pr} не завърши.`,
-      todo: 'виж job-а review в PR-а и пиши тук "опитай пак", когато е наред. Предложение: "опитай пак".', ifNot: 'PR-ът стои и не се слива.',
-    });
-  }
-  const { verdict } = review.marker;
-  if (verdict === 'LIMIT') {
-    // Not a failure: the reviewer runs again once the Max limit resets, and the implementer is not woken.
-    if (!task.waitUntil) {
-      const until = new Date(Math.max(limitUntil, now + 60 * 60 * 1000));
-      updateItem(task.issue, { waitUntil: until.toISOString() });
-      log(`${task.issue}: the review waits for the Max limit; again at ${until.toString()}`);
+    case 'rerun':
+      if (!(await rerunReview(task, reviewCheck))) {
+        return askYoan(task, {
+          kind: 'review_stuck', role: 'reviewer', what: `ревюто на ${task.pr} трябва да се пусне пак, а runner-ът не намира job-а.`,
+          todo: 'пусни job-а review пак в PR-а или пиши тук "опитай пак". Предложение: "опитай пак".', ifNot: 'PR-ът стои и не се слива.',
+        });
+      }
+      updateItem(task.issue, { ...d.set, rerunAt: new Date().toISOString(), reviewSince: new Date().toISOString() });
+      log(`${task.issue}: the review job runs again`);
       return undefined;
-    }
-    if (Date.parse(task.waitUntil) > now) return undefined;
-    if (await rerunReview(task, reviewCheck)) {
-      updateItem(task.issue, { waitUntil: undefined, rerunAt: new Date().toISOString(), reviewSince: new Date().toISOString() });
-      log(`${task.issue}: the review runs again after the limit`);
+    case 'limit-wait':
+      updateItem(task.issue, { waitUntil: d.until, limitWaits: (task.limitWaits ?? 0) + 1 });
+      log(`${task.issue}: the review waits for the Max limit; again at ${d.until}`);
       return undefined;
-    }
-    return askYoan(task, {
-      kind: 'review_stuck', role: 'reviewer', what: `ревюто на ${task.pr} чака лимита на Max, а runner-ът не може да го пусне пак.`,
-      todo: 'пусни job-а review пак в PR-а или пиши тук "опитай пак". Предложение: "опитай пак".', ifNot: 'PR-ът стои и не се слива.',
-    });
+    case 'question':
+      return askYoan(task, {
+        kind: 'review_question', role: 'reviewer', what: `отговор на въпроса на reviewer-а за ${task.pr}.`,
+        todo: 'прочети въпроса и предложения отговор по-долу и отговори тук.', ifNot: 'PR-ът стои и не се слива.', details: d.text.slice(0, 3000),
+      });
+    case 'fix':
+      return fixRound(task, { review: d.review ?? null, failed: d.failed ?? [] });
+    case 'merge':
+      // Only the head the reviewer passed: a push after the review would make GitHub refuse the merge.
+      await gh(['pr', 'merge', task.pr, '--squash', '--match-head-commit', d.sha], { asBot: true, cwd });
+      log(`${task.issue}: merged ${task.pr}`);
+      return finish(task);
+    default:
+      return askYoan(task, {
+        kind: 'review_stuck', role: 'reviewer', what: `${task.pr}: ${d.why}.`,
+        todo: 'виж PR-а и пиши тук "опитай пак", когато е наред. Предложение: "опитай пак".', ifNot: 'PR-ът стои и не се слива.',
+      });
   }
-  recordReview(task, review);
-  const text = reviewText(review.body);
-  if (verdict === 'QUESTION') {
-    return askYoan(task, {
-      kind: 'review_question', role: 'reviewer', what: `отговор на въпроса на reviewer-а за ${task.pr}.`,
-      todo: 'прочети въпроса и предложения отговор по-долу и отговори тук.', ifNot: 'PR-ът стои и не се слива.', details: text.slice(0, 3000),
-    });
-  }
-  if (verdict !== 'PASS') return fixRound(task, { review: text, failed: failedChecks(checks) });
-  const ci = checksVerdict(checks);
-  if (ci === 'pending') return undefined;
-  if (ci === 'fail') return fixRound(task, { failed: failedChecks(checks) });
-  await gh(['pr', 'merge', task.pr, '--squash'], { asBot: true, cwd });
-  log(`${task.issue}: merged ${task.pr}`);
-  return finish(task);
 }
 
 // After the merge: the summary in the task, Done or "Чака Йоан" for the UI check, and the copy goes.
@@ -798,6 +764,17 @@ async function askYoan(task, { kind, role, what, todo, ifNot, details = '' }) {
   await comment(task.issue, body);
 }
 
+// A new start never reuses a branch or a copy of an earlier run (a closed PR, a task started over): -2, -3, ...
+function freeBranch(task) {
+  const repo = config.repos[task.repo];
+  const taken = (branch) => fs.existsSync(path.join(repo, '.claude', 'worktrees', branch))
+    || git(repo, ['branch', '--list', branch]) !== ''
+    || git(repo, ['ls-remote', '--heads', 'origin', branch]) !== '';
+  let branch = task.branch;
+  for (let n = 2; taken(branch); n += 1) branch = `${task.branch}-${n}`;
+  return branch;
+}
+
 const ISSUE_FIELDS = 'id identifier title description branchName state{name type} labels{nodes{name}} inverseRelations{nodes{type issue{identifier state{type}}}}';
 
 // Tasks Yoan moved to Ready go into the queue; a task blocked by an open one stays in Ready until it is free.
@@ -806,16 +783,26 @@ async function takeReady() {
   if (!data) return;
   const known = new Set([...readQueue().map((t) => t.issue), ...activeLocks()]);
   const { add, wait } = planFromReady(data.issues.nodes, known);
+  const entries = readLedger();
   for (const { text, ...task } of add) {
     if (!config.repos[task.repo] || !fs.existsSync(config.repos[task.repo])) {
       logOnce(`repo:${task.issue}`, `linear: ${task.issue} is for ${task.repo}, which is not on this Mac`);
       continue;
     }
+    // A task Yoan stopped (Backlog, Canceled) and put back in Ready goes on where it stopped.
+    const last = [...entries].reverse().find((e) => e.issue === task.issue && ['stopped', 'merged', 'closed'].includes(e.status));
+    if (last?.status === 'stopped' && last.task) {
+      writeQueue([...readQueue(), { ...last.task, ...(['tests', 'tests-fix', 'code', 'fix'].includes(last.task.stage) ? { message: last.task.message ?? CONTINUE } : {}) }]);
+      await setState(task.issue, last.task.stage === 'review' ? 'In Review' : 'In Progress');
+      log(`linear: ${task.issue} goes on at ${last.task.stage}`);
+      continue;
+    }
     const brief = path.join(STATE, 'briefs', `${task.issue}.md`);
     fs.writeFileSync(brief, text);
-    writeQueue([...readQueue(), { ...task, brief, stage: 'tests', since: new Date().toISOString(), sessions: {} }]);
+    const branch = freeBranch(task);
+    writeQueue([...readQueue(), { ...task, branch, brief, stage: 'tests', since: new Date().toISOString(), sessions: {} }]);
     await setState(task.issue, 'In Progress');
-    log(`linear: queued ${task.issue} (${task.repo}${task.ui ? ', UI' : ''})`);
+    log(`linear: queued ${task.issue} (${task.repo}${task.ui ? ', UI' : ''}) on ${branch}`);
   }
   for (const { issue, why } of wait) logOnce(`wait:${issue}:${why}`, `linear: ${issue} stays in Ready (${why})`);
 }
@@ -865,7 +852,7 @@ function resumeAfterAnswer(last, answer) {
     case 'rounds':
       return { ...task, stage: 'fix', round: 0, message: `${said}\n\nFix the PR with this answer, under the same rules, and end with what you changed (in Bulgarian, at most 5 lines) and RESULT: DONE.` };
     case 'dispute':
-      return { ...task, stage: 'tests-fix', message: `${said}\n\nThis settles the disagreement about the test. Change the test if the answer says so (RESULT: DONE), or keep it and say so for the implementer (RESULT: KEEP).` };
+      return { ...task, stage: 'tests-fix', message: `${task.message ?? ''}\n\n${said}\n\nThis settles the disagreement about the test. Change the test if the answer says so (RESULT: DONE), or keep it and say so for the implementer (RESULT: KEEP).`.trim() };
     case 'review_stuck':
       return { ...task, stage: 'review', reviewReruns: undefined, reviewSince: new Date().toISOString() };
     default:
@@ -899,8 +886,8 @@ async function reconcileStatuses() {
     const { action, want, note } = statusAction(task, state);
     if (action === 'remove') {
       updateItem(task.issue, null);
-      ledger({ issue: task.issue, branch: task.branch, status: 'stopped', state: state.name });
-      await comment(task.issue, `**Спряно.** Задачата е в ${state.name}, затова runner-ът я извади от опашката. Върни я в Ready, за да започне отначало.`);
+      ledger({ issue: task.issue, branch: task.branch, status: 'stopped', state: state.name, task: { ...task, waitUntil: undefined } });
+      await comment(task.issue, `**Спряно.** Задачата е в ${state.name}, затова runner-ът я извади от опашката. Върни я в Ready, за да продължи оттам, докъдето стигна.`);
       log(`linear: ${task.issue} is in ${state.name}, taken out of the queue`);
     } else if (action === 'set') {
       await setState(task.issue, want);
@@ -1063,6 +1050,7 @@ async function runStep(task) {
   const unlock = lock(task.issue);
   try {
     if (task.stage === 'tests' || task.stage === 'tests-fix') await stepTests(task);
+    else if (task.stage === 'publish') await publish(task);
     else await stepCode(task);
     updateItem(task.issue, { startFailures: undefined });
   } finally {

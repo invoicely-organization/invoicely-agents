@@ -3,13 +3,14 @@
 # that makes it, and after every session the runner checks the session's whole diff against the same rules, so a
 # write through Bash is caught too. The hook knows the agent from INVOICELY_ROLE, which the runner sets for its
 # sessions, or else from the agent_type of a subagent.
-# The etalons in fixtures/etalons are locked for every agent.
+# The etalons in fixtures/etalons are locked for every agent, and so are Claude Code's own settings, hooks and MCP
+# servers (.claude/, .mcp.json) and git's files (.git): what one session writes there would run in the next one.
 test-author:
   allow: ["**/*.test.ts", "**/*.test.tsx", "**/*.test.mjs", "**/*.test.js", "**/test/**", "e2e/**"]
-  deny: ["fixtures/etalons/**"]
+  deny: ["fixtures/etalons/**", ".claude/**", ".mcp.json", ".git", ".git/**"]
 implementer:
   allow: ["**"]
-  deny: ["**/*.test.ts", "**/*.test.tsx", "**/*.test.mjs", "**/*.test.js", "**/test/**", "e2e/**", "fixtures/etalons/**", "policies/**", ".github/**"]
+  deny: ["**/*.test.ts", "**/*.test.tsx", "**/*.test.mjs", "**/*.test.js", "**/test/**", "e2e/**", "fixtures/etalons/**", "policies/**", ".github/**", ".claude/**", ".mcp.json", ".git", ".git/**"]
 # The reviewer reads and reports; it writes nothing.
 reviewer:
   allow: []

@@ -27,11 +27,13 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: invoicely-organization/invoicely-agents
           ref: main
           path: .agents
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22

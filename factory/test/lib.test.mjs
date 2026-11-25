@@ -14,8 +14,9 @@ test('the usage limit message gives the next reset in local time', () => {
 test('every way Claude says the Max limit counts as the limit, also without a reset time (25.11: "Credit balance is too low")', () => {
   assert.equal(isLimitText('Credit balance is too low'), true);
   assert.equal(isLimitText("You've hit your 5-hour limit · resets 3:20am"), true);
-  assert.equal(isLimitText('API Error: 529 Overloaded'), true);
+  assert.equal(isLimitText('API Error: 529 {"type":"overloaded_error"}'), true);
   assert.equal(isLimitText('TypeError: x is undefined'), false);
+  assert.equal(isLimitText('Added a rate limit to /login'), false);
   const now = new Date(2026, 10, 25, 14, 0);
   assert.equal(retryAt('Credit balance is too low', now).getTime(), now.getTime() + 60 * 60 * 1000);
 });
@@ -35,6 +36,7 @@ test('a run is classified by what it left behind', () => {
   assert.equal(classify({ isError: false, text: 'Bad test.\nRESULT: TEST_WRONG' }), 'test_wrong');
   assert.equal(classify({ isError: false, text: 'May I write here?\nRESULT: QUESTION' }), 'question');
   assert.equal(classify({ isError: false, text: 'Stopped without a result line' }), 'question', 'nothing is lost: Yoan sees it');
+  assert.equal(classify({ isError: false, text: 'Добавих rate limit на /login (429) и overloaded сигнатури.\nRESULT: DONE' }), 'done', 'a finished report is not the limit');
   assert.equal(findPrUrl('see (https://github.com/o/r/pull/12).'), 'https://github.com/o/r/pull/12');
 });
 

@@ -14,10 +14,11 @@ export function parseLimitReset(text, now = new Date()) {
   return reset;
 }
 
-// The Max limit, said in any of the ways Claude Code says it (on 25.11 CI said "Credit balance is too low"), or an
-// overloaded API: none of these is the agent's fault, so the step waits and runs again instead of failing.
+// The Max limit in the words Claude Code itself uses (on 25.11 CI said "Credit balance is too low"), or an
+// overloaded API: none of these is the agent's fault, so the step waits and runs again instead of failing. Only the
+// CLI's own wording: a report about adding a rate limit to /login is not the limit.
 export function isLimitText(text) {
-  return /hit your [^\n]*limit|usage limit|credit balance is too low|rate.?limit|overloaded/i.test(text ?? '');
+  return /hit your [^\n]*limit|usage limit reached|credit balance is too low|rate_limit_error|overloaded_error|API Error: (429|529)\b/i.test(text ?? '');
 }
 
 // When to try again after a limit: the reset Claude gave, or in an hour when it gave none.
@@ -69,12 +70,13 @@ export function parseOutcome(text) {
 }
 
 // limit: wait and resume the same session; error: Claude failed; question: a question for Yoan (also a session that
-// ended without a RESULT line, so nothing is lost); done, test_wrong, keep: the step's outcome.
+// ended without a RESULT line, so nothing is lost); done, test_wrong, keep: the step's outcome. A session that ended
+// with a RESULT line finished, whatever its report says.
 export function classify({ isError, text }) {
-  if (isLimitText(text)) return 'limit';
-  if (isError) return 'error';
+  if (isError) return isLimitText(text) ? 'limit' : 'error';
   const { kind } = parseOutcome(text);
-  return kind ? kind.toLowerCase() : 'question';
+  if (kind) return kind.toLowerCase();
+  return isLimitText(text) ? 'limit' : 'question';
 }
 
 export function minutesBetween(start, end) {
@@ -89,10 +91,11 @@ export function isReviewCheck(name) {
 }
 
 // `gh pr checks --json name,bucket` gives pass, fail, pending, skipping or cancel per check. The review check is
-// left out: its verdict is read from the review itself. No checks yet counts as pending.
-export function checksVerdict(checks) {
+// left out: its verdict is read from the review itself. No other checks counts as pending, or as pass once the
+// review is in (a repo whose only workflow is the review, such as invoicely before its CI).
+export function checksVerdict(checks, { emptyIs = 'pending' } = {}) {
   const own = (checks ?? []).filter((c) => !isReviewCheck(c.name));
-  if (own.length === 0) return 'pending';
+  if (own.length === 0) return emptyIs;
   if (own.some((c) => c.bucket === 'fail' || c.bucket === 'cancel')) return 'fail';
   if (own.some((c) => c.bucket === 'pending')) return 'pending';
   return 'pass';
@@ -102,9 +105,10 @@ export function failedChecks(checks) {
   return (checks ?? []).filter((c) => !isReviewCheck(c.name) && (c.bucket === 'fail' || c.bucket === 'cancel')).map((c) => c.name);
 }
 
-// The hidden line the review job writes into every review: <!-- invoicely-review verdict=PASS sha=abc cost=0.42 -->
+// The hidden line the review job writes at the end of every review: <!-- invoicely-review verdict=PASS sha=abc cost=0.42 -->
+// The last one counts: the job strips comment markers from the reviewer's text, and the real marker comes after it.
 export function reviewMarker(body) {
-  const match = /<!--\s*invoicely-review\s+([^>]*?)\s*-->/.exec(body ?? '');
+  const match = [...(body ?? '').matchAll(/<!--\s*invoicely-review\s+([^>]*?)\s*-->/g)].at(-1);
   if (!match) return null;
   const fields = Object.fromEntries(match[1].split(/\s+/).map((pair) => pair.split('=')).filter((p) => p.length === 2));
   if (!fields.verdict) return null;
@@ -132,15 +136,65 @@ export function findingLines(text) {
 }
 
 // What the implementer gets in a fix round: the review's findings, the red checks, or a conflict with main.
-export function fixMessage({ round, maxRounds, review, failed = [], conflict = false }) {
+export function fixMessage({ round, maxRounds, review, failed = [], conflict = null }) {
   return [
     `Fix round ${round} of ${maxRounds} on your PR.`,
     ...(review ? [`The reviewer did not pass it. Its review:\n\n${review}`] : []),
     ...(failed.length ? [`These CI checks failed: ${failed.join(', ')}. Run the same checks here to see why.`] : []),
-    ...(conflict ? ['The PR conflicts with main: run git fetch origin and git merge origin/main, and resolve the conflicts so that both sides\' changes stay.'] : []),
+    ...(conflict ? [`main moved on and the PR conflicts with it. The runner started the merge of main into your branch; git left conflict markers in: ${conflict.join(', ')}. Resolve them so that both sides' changes stay, and run the tests. Do not run git commands yourself: the runner commits the merge.`] : []),
     'Fix every blocking and critical finding and every failed check, in this worktree, under the same rules as before: do not change the tests. If a finding says a test is wrong, or you think so, end with RESULT: TEST_WRONG and the reason. If a finding needs Yoan, end with RESULT: QUESTION.',
     'Do not commit or push: the runner does that. End with what you changed (in Bulgarian, at most 5 lines) and RESULT: DONE.',
   ].join('\n\n');
+}
+
+// What the runner does with a PR that waits for its review, from what GitHub shows now. Pure, so it can be tested.
+// task: the queue item (pushedSha, reviewSince, rerunAt, reviewReruns, waitUntil, limitWaits, needsReviewRerun).
+// view: gh pr view (state, headRefOid, mergeable). checks: gh pr checks, or null when GitHub did not answer.
+// reviews: the PR's reviews. Returns { action, ... }:
+//   finish, closed, wait, merge-main, rerun { set }, limit-wait { until }, question { text }, fix { review, failed },
+//   merge { sha }, ask { why }.
+export function reviewDecision({ task, view, checks, reviews, now = Date.now(), limitUntil = 0, timeoutMinutes = 150, maxLimitWaits = 8 }) {
+  if (view.state === 'MERGED') return { action: 'finish' };
+  if (view.state === 'CLOSED') return { action: 'closed' };
+  const waited = (now - Date.parse(task.reviewSince ?? new Date(now).toISOString())) / 60000;
+  const late = waited >= timeoutMinutes;
+  const waitOrAsk = (why) => (late ? { action: 'ask', why } : { action: 'wait' });
+  // GitHub may still show the head before the runner's push for a few seconds: never act on an old head.
+  if (task.pushedSha && view.headRefOid !== task.pushedSha) return waitOrAsk('PR-ът не показва последния push на runner-а');
+  if (view.mergeable === 'CONFLICTING') return { action: 'merge-main' };
+  if (!checks) return waitOrAsk('GitHub не показва проверките на PR-а');
+  const reviewCheck = checks.find((c) => isReviewCheck(c.name));
+  if (task.needsReviewRerun) {
+    if (reviewCheck?.bucket === 'pending') return { action: 'wait' };
+    return { action: 'rerun', set: { needsReviewRerun: undefined } };
+  }
+  const review = reviewOfHead(reviews, view.headRefOid);
+  const recentlyRerun = task.rerunAt && now - Date.parse(task.rerunAt) < 10 * 60 * 1000;
+  // A red CI is fixed first: the review job waits for the checks and does not run on a red build.
+  if (!review && checksVerdict(checks) === 'fail') return { action: 'fix', failed: failedChecks(checks) };
+  const rerunOnce = (why) => (task.reviewReruns ? { action: 'ask', why } : { action: 'rerun', set: { reviewReruns: 1 } });
+  if (!review || reviewCheck?.bucket === 'pending' || recentlyRerun) {
+    if (!review && reviewCheck && reviewCheck.bucket !== 'pending' && !recentlyRerun) return rerunOnce('job-ът review свърши, без да напише ревю');
+    return late ? rerunOnce('ревюто не дойде') : { action: 'wait' };
+  }
+  const { verdict } = review.marker;
+  if (verdict === 'LIMIT') {
+    // Not a failure: the reviewer runs again once the Max limit resets, and the implementer is not woken.
+    if (!task.waitUntil) {
+      if ((task.limitWaits ?? 0) >= maxLimitWaits) return { action: 'ask', why: `лимитът на Max не се поднови след ${maxLimitWaits} опита` };
+      return { action: 'limit-wait', until: new Date(Math.max(limitUntil, now + 60 * 60 * 1000)).toISOString() };
+    }
+    if (Date.parse(task.waitUntil) > now) return { action: 'wait' };
+    return { action: 'rerun', set: { waitUntil: undefined } };
+  }
+  if (verdict === 'ERROR') return rerunOnce('ревюто не завърши');
+  const text = reviewText(review.body);
+  if (verdict === 'QUESTION') return { action: 'question', text, reviewEntry: review };
+  if (verdict !== 'PASS') return { action: 'fix', review: text, failed: failedChecks(checks), reviewEntry: review };
+  const ci = checksVerdict(checks, { emptyIs: 'pass' });
+  if (ci === 'pending') return late ? { action: 'ask', why: 'CI не свърши', reviewEntry: review } : { action: 'wait', reviewEntry: review };
+  if (ci === 'fail') return { action: 'fix', failed: failedChecks(checks), reviewEntry: review };
+  return { action: 'merge', sha: view.headRefOid, reviewEntry: review };
 }
 
 // --- Money ---
