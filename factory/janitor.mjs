@@ -17,11 +17,15 @@ export function prForBranch(prs, branch) {
 const over = (pr) => pr && (pr.state === 'MERGED' || pr.state === 'CLOSED');
 
 // copies: [{ path, branch, head, dirty }]; branch is null for a detached copy.
-// prs: [{ number, headRefName, headRefOid, state }] from gh pr list --state all.
+// prs: [{ number, headRefName, headRefOid, baseRefName, state }] from gh pr list --state all.
+// copies may carry ageDays: days since their last commit.
 // queue: the runner's queue; protectedPaths: copies the runner itself needs (the plugin's copy, its own copy).
 // localBranches, remoteBranches: [{ name, head }]; a local branch checked out in a copy is never deleted.
-export function planCleanup({ copies = [], prs = [], queue = [], protectedPaths = [], localBranches = [], remoteBranches = [] }) {
+export function planCleanup({ copies = [], prs = [], queue = [], protectedPaths = [], localBranches = [], remoteBranches = [], staleDays = 7 }) {
   const queued = new Set(queue.map((t) => t.branch));
+  // A branch another open PR or a queued task builds on is never deleted, even when its own PR is over: GitHub
+  // would retarget or close the PRs on top of it (on 25.11 PR #23 targets inv-30-45-linear, the head of #19).
+  const bases = new Set([...prs.filter((p) => p.state === 'OPEN').map((p) => p.baseRefName), ...queue.map((t) => t.base)].filter(Boolean));
   const plan = { removeCopies: [], keepCopies: [], report: [], deleteLocal: [], deleteRemote: [] };
   const removed = new Set();
   for (const copy of copies) {
@@ -33,7 +37,12 @@ export function planCleanup({ copies = [], prs = [], queue = [], protectedPaths 
     if (!copy.branch) { keep('detached, not a task copy'); continue; }
     if (queued.has(copy.branch)) { keep('its task is in the queue'); continue; }
     const pr = prForBranch(prs, copy.branch);
-    if (!pr) { keep('no PR yet'); continue; }
+    if (!pr) {
+      // Nothing stays forever unnoticed: a copy with no PR and no task for a week is reported once.
+      const stale = (copy.ageDays ?? 0) >= staleDays;
+      keep(stale ? `no PR and no task for ${Math.floor(copy.ageDays)} days` : 'no PR yet', stale);
+      continue;
+    }
     if (!over(pr)) { keep(`PR #${pr.number} is open`); continue; }
     if (copy.dirty) { keep(`PR #${pr.number} is ${pr.state.toLowerCase()} but the copy has uncommitted changes`, true); continue; }
     if (copy.head !== pr.headRefOid) { keep(`PR #${pr.number} is ${pr.state.toLowerCase()} but the copy has commits that are not in it`, true); continue; }
@@ -41,8 +50,9 @@ export function planCleanup({ copies = [], prs = [], queue = [], protectedPaths 
     removed.add(copy.branch);
   }
   const checkedOut = new Set(copies.filter((c) => c.branch && !removed.has(c.branch)).map((c) => c.branch));
+  const keptWithWork = new Set(plan.report.map((r) => r.branch));
   const deletable = (b) => {
-    if (KEEP_BRANCHES.test(b.name) || /^feature\//.test(b.name) || queued.has(b.name)) return false;
+    if (KEEP_BRANCHES.test(b.name) || /^feature\//.test(b.name) || queued.has(b.name) || bases.has(b.name) || keptWithWork.has(b.name)) return false;
     const pr = prForBranch(prs, b.name);
     return over(pr) && b.head === pr.headRefOid;
   };

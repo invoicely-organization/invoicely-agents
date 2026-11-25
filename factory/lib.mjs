@@ -171,6 +171,14 @@ export function taskSpent(entries, issue) {
   return entries.reduce((sum, e, i) => (e.issue === issue && e.status !== 'ci-evals' ? sum + costs[i] : sum), 0);
 }
 
+// Yoan's answer to a task over its cap: "спри" stops it, a bare "продължи" goes on, anything else goes on with his
+// words passed to the agent. The u flag makes the word boundaries work for Cyrillic ("спринт" is not "спри").
+export function budgetAnswer(text) {
+  const t = (text ?? '').trim();
+  if (/(^|[^\p{L}])спри([^\p{L}]|$)/iu.test(t)) return 'stop';
+  return /^продължи[\s.!]*$/iu.test(t) ? 'continue' : 'continue-with-note';
+}
+
 // The budget of the next session: what is left of the task's cap and of the period's cap, whichever is smaller.
 // Under $2 left is not worth a session; stoppedBy says which cap stops it.
 export function sessionBudget({ taskCap, taskSpent: spentOnTask = 0, periodCap, periodSpent = 0 }) {

@@ -31,7 +31,10 @@ const home = os.homedir();
 // Folders that hold copies outside a repo: the old place of the runner's copies.
 const holders = [path.join(home, 'projects', 'ia-wt')];
 
-const expand = (p) => (p === '~' ? home : p.startsWith('~/') ? path.join(home, p.slice(2)) : p);
+const expand = (p) => {
+  const q = p.replace(/^\$\{?HOME\}?(?=\/|$)/, home);
+  return q === '~' ? home : q.startsWith('~/') ? path.join(home, q.slice(2)) : q;
+};
 const within = (child, parent) => child === parent || child.startsWith(parent + path.sep);
 
 // A copy, a folder of copies, or a folder above one.
@@ -56,10 +59,10 @@ for (const part of command.split(/&&|\|\||;|\||\n/).map((p) => p.trim()).filter(
     continue;
   }
   const git = words.indexOf('git');
-  if (git >= 0 && words[git + 1] === 'worktree' && ['remove', 'move'].includes(words[git + 2])) {
-    deny(`git worktree ${words[git + 2]} by hand`);
-  }
-  const at = words.findIndex((w) => MOVERS.has(path.basename(w)));
+  const wt = git >= 0 ? words.indexOf('worktree', git + 1) : -1; // also `git -C <repo> worktree remove`
+  if (wt > 0 && ['remove', 'move'].includes(words[wt + 1])) deny(`git worktree ${words[wt + 1]} by hand`);
+  // `git rm` removes tracked files inside the repo, never the copy itself.
+  const at = words.findIndex((w, i) => MOVERS.has(path.basename(w)) && words[i - 1] !== 'git');
   if (at < 0) continue;
   for (const arg of words.slice(at + 1)) {
     if (!arg || arg.startsWith('-')) continue;

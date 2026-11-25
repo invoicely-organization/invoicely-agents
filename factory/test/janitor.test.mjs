@@ -59,6 +59,35 @@ test('a branch goes only when its PR is over and its tip is the PR head', () => 
   assert.deepEqual(plan.deleteRemote, ['inv-39-ledger']);
 });
 
+test('a branch that an open PR or a queued task builds on is never deleted (independent review, 25.11)', () => {
+  const stack = [
+    { number: 19, headRefName: 'inv-30-45-linear', headRefOid: '299c916', baseRefName: 'inv-39-ledger-v2', state: 'MERGED' },
+    { number: 23, headRefName: 'inv-46-factory-order', headRefOid: '87de94d', baseRefName: 'main', state: 'OPEN' },
+    { number: 24, headRefName: 'on-top', headRefOid: 'aaa', baseRefName: 'inv-30-45-linear', state: 'OPEN' },
+  ];
+  const plan = planCleanup({
+    prs: stack, queue: [{ issue: 'INV-60', branch: 'inv-60-x', base: 'inv-39-ledger-v2' }],
+    remoteBranches: [{ name: 'inv-30-45-linear', head: '299c916' }, { name: 'inv-39-ledger-v2', head: 'b1ae5ae' }],
+  });
+  assert.deepEqual(plan.deleteRemote, []);
+});
+
+test('the branch of a copy kept for unsaved work stays on GitHub too', () => {
+  const plan = planCleanup({
+    copies: [{ path: '/p/x', branch: 'inv-32-test-author', head: 'd4681cf', dirty: true }], prs,
+    remoteBranches: [{ name: 'inv-32-test-author', head: 'd4681cf' }],
+  });
+  assert.deepEqual(plan.deleteRemote, []);
+});
+
+test('a copy with no PR is kept, and reported once it has waited a week', () => {
+  const young = planCleanup({ copies: [{ path: '/p/a', branch: 'inv-70-x', head: '1', dirty: false, ageDays: 2 }] });
+  const old = planCleanup({ copies: [{ path: '/p/b', branch: 'inv-71-y', head: '2', dirty: false, ageDays: 9.5 }] });
+  assert.deepEqual(young.report, []);
+  assert.equal(old.report[0].why, 'no PR and no task for 9 days');
+  assert.equal(old.removeCopies.length, 0);
+});
+
 test('the open PR of a branch decides over an older closed one', () => {
   const both = [{ number: 12, headRefName: 'b', headRefOid: 'a1', state: 'CLOSED' }, { number: 15, headRefName: 'b', headRefOid: 'a2', state: 'OPEN' }];
   assert.equal(prForBranch(both, 'b').number, 15);

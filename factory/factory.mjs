@@ -23,7 +23,7 @@ import { answerAfter, planFromReady } from './linear-sync.mjs';
 import { cleanupSummary, oldLogs, parseWorktrees, planCleanup } from './janitor.mjs';
 import {
   blockingDeps, checksVerdict, classify, failedChecks, fillTemplate, findPrUrl, fixMessage, inWindow, isFeatureBranch,
-  entryCosts, featurePrBody, featureReady, minutesBetween, nextRunnable, nextWindowStart, nightReport, nightStart, parseLimitReset, parseResult,
+  budgetAnswer, entryCosts, featurePrBody, featureReady, minutesBetween, nextRunnable, nextWindowStart, nightReport, nightStart, parseLimitReset, parseResult,
   servicePlist, sessionBudget, sessionDirName, shouldRerunEvals, spendingPeriod, spentSince, statusAction, taskSpent,
 } from './lib.mjs';
 
@@ -72,7 +72,8 @@ const ALLOWED_TOOLS = [
   // node only for tests and the repo's own scripts, not `node -e`; no cat: Read does that and the secret guard
   // checks it (INV-51). factory/ is the runner's, not the agents'.
   'Bash(claude plugin validate:*)', 'Bash(claude plugin eval:*)', 'Bash(node --test:*)', 'Bash(node --check:*)',
-  'Bash(node scripts/:*)', 'Bash(node hooks/:*)', 'Bash(node evals/:*)',
+  // The * form: on 25.11 `Bash(node scripts/:*)` refused `node scripts/x.mjs`, `Bash(node scripts/*)` allowed it.
+  'Bash(node scripts/*)', 'Bash(node hooks/*)', 'Bash(node evals/*)',
   'Bash(git status:*)', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git add:*)', 'Bash(git commit:*)', 'Bash(git push:*)',
   'Bash(gh pr create:*)', 'Bash(gh pr view:*)', 'Bash(gh pr checks:*)', 'Bash(gh run view:*)', 'Bash(gh run list:*)',
   'Bash(git fetch:*)', 'Bash(git merge:*)', 'Bash(ls:*)', 'Bash(mkdir:*)', 'Bash(chmod:*)',
@@ -230,6 +231,20 @@ async function rerunFailedJobs(item) {
     log(`${item.issue}: rerun: ${error.message.split('\n')[0]}`);
     return false;
   }
+}
+
+// The tasks whose session runs now: lock files of a process that is gone (a power cut) do not count.
+function activeLocks() {
+  return fs.readdirSync(path.join(STATE, 'locks')).filter((file) => {
+    const pid = Number(readJson(path.join(STATE, 'locks', file), {}).pid);
+    if (!pid) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return error.code === 'EPERM';
+    }
+  }).map((file) => file.replace(/\.lock$/, ''));
 }
 
 // One task, one session: a second run of the same task is refused while the first one lives.
@@ -673,12 +688,13 @@ async function takeAnswers() {
     if (!answer) continue;
     ledger({ issue: issue.identifier, ended: new Date().toISOString(), status: 'answered' });
     if (last.status === 'over_budget') {
-      if (/спри/i.test(answer)) {
+      const decision = budgetAnswer(answer);
+      if (decision === 'stop') {
         log(`linear: ${issue.identifier}: Yoan stops it at its cap`);
         continue;
       }
       const task = { ...last.task, budgetUsd: last.capUsd + config.budgetUsd };
-      if (!/^\s*продължи\W*$/i.test(answer) && task.resumeSession) {
+      if (decision === 'continue-with-note' && task.resumeSession) {
         task.message = `Yoan answered in Linear:\n\n${answer}\n\n${task.message ?? 'Continue exactly where you stopped and finish the same instructions.'}`;
       }
       const latest = readJson(QUEUE, []);
@@ -808,13 +824,19 @@ async function cleanupFacts({ fetch }) {
       } catch {
         // a copy git cannot read is treated as holding work
       }
-      return { ...w, dirty };
+      let ageDays = 0;
+      try {
+        ageDays = (Date.now() / 1000 - Number(git(w.path, ['log', '-1', '--format=%ct']))) / 86400;
+      } catch {
+        // no commit: treated as new
+      }
+      return { ...w, dirty, ageDays };
     });
   const refs = (prefix) => git(config.repo, ['for-each-ref', prefix, '--format=%(refname:short) %(objectname)'])
     .split('\n').filter(Boolean).map((line) => { const [name, head] = line.split(' '); return { name, head }; });
   const remoteBranches = refs('refs/remotes/origin').filter((b) => b.name.startsWith('origin/') && b.name !== 'origin/HEAD')
     .map((b) => ({ name: b.name.slice('origin/'.length), head: b.head }));
-  const prs = await gh(['pr', 'list', '--state', 'all', '--limit', '500', '--json', 'number,headRefName,headRefOid,state'], { json: true });
+  const prs = await gh(['pr', 'list', '--state', 'all', '--limit', '500', '--json', 'number,headRefName,headRefOid,baseRefName,state'], { json: true });
   // The plugin's copy, the copy this runner runs from, and the main checkout are never touched.
   const protectedPaths = [path.join(config.legacyWorktrees, 'plugin-runtime'), path.dirname(HERE), config.repo];
   return { copies, prs, localBranches: refs('refs/heads'), remoteBranches, protectedPaths, queue: readJson(QUEUE, []) };
@@ -908,12 +930,13 @@ async function maybeCleanup() {
   const stateFile = path.join(STATE, 'cleanup.json');
   const today = now.toLocaleDateString('sv-SE');
   if (readJson(stateFile, {}).lastRun === today) return;
-  if (fs.readdirSync(path.join(STATE, 'locks')).length > 0) return;
+  if (activeLocks().length > 0) return;
   retireOldCopies();
   const result = await cleanup();
+  if (!result) return; // GitHub or git failed: tried again next round
   const state = readJson(stateFile, {});
   state.lastRun = today;
-  if (result) state.summary = { day: today, text: cleanupSummary(result.plan, result.done) };
+  state.summary = { day: today, text: cleanupSummary(result.plan, result.done) };
   fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
 }
 
@@ -938,7 +961,7 @@ function updateRunnerCode() {
     }
     logOnce(`code:${git(config.repo, ['rev-parse', 'HEAD'])}`, 'the runner code changed in main; restart the runner to use it');
   } catch (error) {
-    log(`update: ${error.message.split('\n')[0]}`);
+    logOnce(`update:${error.message.split('\n')[0]}`, `update: ${error.message.split('\n')[0]}`);
   }
 }
 
@@ -946,7 +969,8 @@ function updateRunnerCode() {
 // runner's old copy in ~/projects/ia-wt. Only when clean, and the runner's old copy only once the bot tools no
 // longer load code from it. The old folder goes when it is empty. The copy guard stops removing them by hand.
 function retireOldCopies() {
-  if (!RUNS_FROM_REPO) return;
+  // Never while paused or while a session runs: an old session may still load its plugin from plugin-runtime.
+  if (!RUNS_FROM_REPO || fs.existsSync(PAUSED) || activeLocks().length > 0) return;
   const tools = path.join(STATE, 'tools');
   const usedByTools = (dir) => fs.existsSync(tools) && fs.readdirSync(tools).some((f) => f.endsWith('.mjs') && fs.readFileSync(path.join(tools, f), 'utf8').includes(dir));
   for (const name of ['plugin-runtime', 'factory-runner']) {
@@ -1126,8 +1150,8 @@ async function main() {
     fs.writeFileSync(PAUSED, `${new Date().toISOString()}\n`);
     console.log('paused: the runner finishes the session that runs now and then starts nothing until `factory resume`');
     if (sub === '--wait' || rest.includes('--wait')) {
-      while (fs.readdirSync(path.join(STATE, 'locks')).length > 0) {
-        console.log(`waiting for ${fs.readdirSync(path.join(STATE, 'locks')).join(', ')} to finish`);
+      while (activeLocks().length > 0) {
+        console.log(`waiting for ${activeLocks().join(', ')} to finish`);
         await sleep(60 * 1000);
       }
       console.log('no session runs: the copies may be worked on');
@@ -1174,6 +1198,10 @@ async function main() {
       return console.log(`${issueKey}: ${more.join(' ')}`);
     }
     if (!body) return console.log('--body-file <file> is needed');
+    // One writer: a task in the runner's queue is the runner's, and its status check would undo the question.
+    if (sub === 'ask' && readJson(QUEUE, []).some((t) => t.issue === issueKey)) {
+      return console.log(`${issueKey} is in the runner's queue, so its status is the runner's: write a note with \`factory linear comment\`; questions about it come from its agent`);
+    }
     if (sub === 'ask') {
       const who = await yoanMention();
       await setState(issueKey, 'Чака Йоан');

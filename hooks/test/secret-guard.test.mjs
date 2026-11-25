@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { runHook, tempDir } from './helpers.mjs';
@@ -33,6 +33,27 @@ test('Bash cannot reach them either, by absolute, home or relative path', () => 
   assert.equal(call('Bash', { command: 'cat ../../.invoicely/github-app.pem' }, path.join(home, 'projects', 'x')).denied, true);
   assert.equal(call('Bash', { command: 'security find-generic-password -s claude -w' }).denied, true);
   assert.equal(call('Bash', { command: 'ls ~/.ssh' }).denied, true);
+});
+
+test('a folder that holds secrets cannot be searched, listed or diffed (independent review, 25.11)', () => {
+  assert.equal(call('Grep', { pattern: 'BEGIN', path: state, output_mode: 'content' }).denied, true);
+  assert.equal(call('Grep', { pattern: 'token', path: home }).denied, true);
+  assert.equal(call('Glob', { pattern: `${home}/**/*.json` }).denied, true);
+  assert.equal(call('Bash', { command: `mkdir /tmp/e && git diff --no-index /tmp/e ${state}` }).denied, true);
+  assert.equal(call('Bash', { command: 'ls -la ~' }).denied, true);
+  assert.equal(call('Grep', { pattern: 'cell 18', path: path.join(home, 'projects') }).denied, false);
+});
+
+test('case does not help on the Mac', { skip: process.platform !== 'darwin' }, () => {
+  assert.equal(call('Read', { file_path: path.join(home, '.INVOICELY', '.ENV') }).denied, true);
+  assert.equal(call('Read', { file_path: path.join(state, 'GitHub-App.PEM') }).denied, true);
+});
+
+test('naming .env in a message passes; reading a real one does not', () => {
+  assert.equal(call('Bash', { command: 'git commit -m "INV-12: read the config from .env"' }).denied, false);
+  assert.equal(call('Bash', { command: 'git config core.sshCommand' }).denied, false);
+  writeFileSync(path.join(work, '.env'), 'KEY=fake\n');
+  assert.equal(call('Bash', { command: 'cat .env' }).denied, true);
 });
 
 test('key and env files anywhere are secret, and writing them is blocked too', () => {

@@ -48,4 +48,11 @@ test('git worktree remove and move by hand are blocked; the runner does it', () 
   assert.equal(result.denied, true);
   assert.match(result.reason, /runner creates and removes task copies/);
   assert.equal(bash('git worktree move a b').denied, true);
+  assert.equal(bash(`git -C ${repo} worktree remove ${builtIn}`).denied, true);
+});
+
+test('$HOME is expanded, and git rm inside a copy passes (independent review, 25.11)', () => {
+  assert.equal(bash('rm -rf "$HOME/projects/ia-wt"').denied, true);
+  assert.equal(bash('mv ${HOME}/projects/ia-wt /tmp/x').denied, true);
+  assert.equal(bash('git rm -r --cached .', builtIn).denied, false);
 });
