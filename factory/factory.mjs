@@ -24,7 +24,7 @@ import { cleanupSummary, oldLogs, parseWorktrees, planCleanup } from './janitor.
 import {
   blockingDeps, checksVerdict, classify, failedChecks, fillTemplate, findPrUrl, fixMessage, inWindow, isFeatureBranch,
   entryCosts, minutesBetween, nextRunnable, nextWindowStart, nightReport, nightStart, parseLimitReset, parseResult,
-  servicePlist, sessionBudget, sessionDirName, spendingPeriod, spentSince, statusAction, taskSpent,
+  servicePlist, sessionBudget, sessionDirName, shouldRerunEvals, spendingPeriod, spentSince, statusAction, taskSpent,
 } from './lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -212,6 +212,24 @@ async function advanceCi(item) {
   if (verdict !== 'pass') return { verdict, failed: failedChecks(checks) };
   await gh(['pr', 'merge', item.pr, '--squash'], { asBot: true });
   return { verdict: 'merged' };
+}
+
+// Runs the failed jobs of the PR's last CI run again: as the bot, or as Yoan when the App may not (INV-53).
+async function rerunFailedJobs(item) {
+  try {
+    const runs = await gh(['run', 'list', '--branch', item.branch, '--event', 'pull_request', '--limit', '1', '--json', 'databaseId'], { json: true });
+    const id = runs?.[0]?.databaseId;
+    if (!id) return false;
+    try {
+      await gh(['run', 'rerun', String(id), '--failed'], { asBot: true });
+    } catch {
+      await gh(['run', 'rerun', String(id), '--failed']);
+    }
+    return true;
+  } catch (error) {
+    log(`${item.issue}: rerun: ${error.message.split('\n')[0]}`);
+    return false;
+  }
 }
 
 // One task, one session: a second run of the same task is refused while the first one lives.
@@ -539,6 +557,11 @@ async function processCi() {
       log(`${item.issue}: ${entry.status} ${item.pr}`);
       if (entry.status === 'merged') await reportToLinear(entry, '');
       await cleanup({ only: item.branch }); // the task's copy and branch go with it (INV-48)
+      continue;
+    }
+    if (result.verdict === 'fail' && shouldRerunEvals(result.failed, item) && (await rerunFailedJobs(item))) {
+      updateItem(item.issue, { evalReruns: 1, ciSince: new Date().toISOString() });
+      log(`${item.issue}: only the evals failed; CI runs them once more before a fix round`);
       continue;
     }
     const rounds = item.fixRounds ?? 0;

@@ -99,10 +99,18 @@ export function fixMessage({ pr, failed, branch, base }) {
     conflict
       ? `Another task was merged into ${base} first. Run git fetch origin and git merge origin/${base}, resolve the conflicts so that both sides' changes stay (for example both agents' entries in policies/role-guard.yaml), and do not drop the other task's work.`
       : `See why with: gh pr checks ${pr}   and   gh run view <run id> --log-failed`,
+    'Fix only what this task changed. If a failing eval case is about another agent that this task did not change, do not change that agent or its cases: name the case and say so in your answer (INV-53).',
     `Fix it in this worktree, run the checks from your instructions again, then commit and git push to ${branch}.`,
     'Do not open a new PR and do not change the PR base.',
     `End with what you changed, the check results and the PR URL: ${pr}`,
   ].join('\n');
+}
+
+// The judges of an eval case can change their mind from one run to the next (on 25.11 PR #20 failed two cases of
+// prompt-engineer and passed them on a rerun). So when only the evals failed, CI runs them once more before an agent
+// is woken up for a fix round (INV-53).
+export function shouldRerunEvals(failed, item) {
+  return Array.isArray(failed) && failed.length === 1 && failed[0] === 'evals' && !item.evalReruns;
 }
 
 // Pick the next task to run: the first one that is not waiting for CI and whose dependencies are merged
