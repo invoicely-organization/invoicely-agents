@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { classify, fillTemplate, findPrUrl, isLimitText, parseLimitReset, parseOutcome, parseResult, retryAt, sessionDirName } from '../lib.mjs';
+import { classify, fillTemplate, findPrUrl, isLimitText, parseLimitReset, parseOutcome, parseResult, retryAt, sessionDirName, transcriptFile } from '../lib.mjs';
 
 test('the usage limit message gives the next reset in local time', () => {
   const now = new Date(2026, 10, 24, 2, 40);
@@ -53,4 +53,6 @@ test('the JSON result is read, and plain text counts as an error', () => {
 test('templates and session folders', () => {
   assert.equal(fillTemplate('{ISSUE} on {BRANCH} {OTHER}', { ISSUE: 'INV-31', BRANCH: 'inv-31-reviewer' }), 'INV-31 on inv-31-reviewer {OTHER}');
   assert.equal(sessionDirName('/Users/yoan/projects/invoicely/.claude/worktrees/inv-70-x'), '-Users-yoan-projects-invoicely--claude-worktrees-inv-70-x');
+  assert.equal(transcriptFile('/Users/yoan', '/Users/yoan/projects/invoicely/.claude/worktrees/inv-70-x', 'abc'),
+    '/Users/yoan/.claude/projects/-Users-yoan-projects-invoicely--claude-worktrees-inv-70-x/abc.jsonl');
 });
