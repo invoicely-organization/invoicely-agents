@@ -23,7 +23,7 @@ import { answerAfter, planFromReady } from './linear-sync.mjs';
 import { cleanupSummary, oldLogs, parseWorktrees, planCleanup } from './janitor.mjs';
 import {
   blockingDeps, checksVerdict, classify, failedChecks, fillTemplate, findPrUrl, fixMessage, inWindow, isFeatureBranch,
-  entryCosts, minutesBetween, nextRunnable, nextWindowStart, nightReport, nightStart, parseLimitReset, parseResult,
+  entryCosts, featurePrBody, featureReady, minutesBetween, nextRunnable, nextWindowStart, nightReport, nightStart, parseLimitReset, parseResult,
   servicePlist, sessionBudget, sessionDirName, shouldRerunEvals, spendingPeriod, spentSince, statusAction, taskSpent,
 } from './lib.mjs';
 
@@ -744,6 +744,39 @@ async function reconcileStatuses() {
   }
 }
 
+// When every subtask of a feature is merged into feature/<id>, the runner opens one PR from it to main for Yoan
+// and the feature waits for him there (INV-54). Checked every round for the features merged into in the last week,
+// because Linear marks a merged subtask Done a little after the merge.
+async function openFeaturePrs() {
+  const week = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const bases = new Set(readLedger().filter((e) => e.status === 'merged' && isFeatureBranch(e.base) && Date.parse(e.ended) >= week).map((e) => e.base));
+  const done = new Set(readLedger().filter((e) => e.status === 'feature_pr').map((e) => e.branch));
+  for (const base of bases) {
+    if (done.has(base)) continue;
+    const id = base.slice('feature/'.length);
+    const feature = (await linear('query($id:String!){issue(id:$id){identifier title children(first:50){nodes{identifier title state{type}}}}}', { id }))?.issue;
+    if (!feature || !featureReady(feature.children?.nodes ?? [], readJson(QUEUE, []), base)) continue;
+    const open = await gh(['pr', 'list', '--head', base, '--base', 'main', '--state', 'open', '--json', 'url'], { json: true });
+    let url = open[0]?.url;
+    if (!url) {
+      const merged = await gh(['pr', 'list', '--base', base, '--state', 'merged', '--limit', '100', '--json', 'number,title,url'], { json: true });
+      const file = path.join(os.tmpdir(), `invoicely-feature-${id}.md`);
+      fs.writeFileSync(file, featurePrBody({ feature, children: feature.children.nodes, merged, repo: path.basename(config.repo) }));
+      try {
+        url = findPrUrl(await gh(['pr', 'create', '--base', 'main', '--head', base, '--title', `${id}: ${feature.title}`, '--body-file', file], { asBot: true }));
+      } finally {
+        fs.rmSync(file, { force: true });
+      }
+    }
+    if (!url) continue;
+    ledger({ issue: id, branch: base, base: 'main', ended: new Date().toISOString(), status: 'feature_pr', pr: url });
+    await askYoan(id, `одобрение на PR-а на функционалността: ${url}. Всички подзадачи са слети във \`${base}\`.`,
+      'прочети резюмето най-горе в PR-а, тествай по "Какво да тестваш" и одобри в GitHub. Предложение: одобри, ако CI е зелен и тестът минава.',
+      'функционалността остава във feature клона и не стига до main.');
+    log(`${id}: all subtasks merged, feature PR ${url}`);
+  }
+}
+
 async function syncFromLinear() {
   if (Date.now() - lastSync < 5 * 60 * 1000) return;
   lastSync = Date.now();
@@ -751,6 +784,7 @@ async function syncFromLinear() {
     await takeAnswers();
     await takeReady();
     await reconcileStatuses();
+    await openFeaturePrs();
   } catch (error) {
     log(`linear sync: ${error.message.slice(0, 300)}`);
   }

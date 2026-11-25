@@ -184,7 +184,7 @@ export function sessionBudget({ taskCap, taskSpent: spentOnTask = 0, periodCap, 
 const STATUS_BG = {
   done: 'PR отворен', merged: 'слято', needs_answer: 'въпрос към теб', limit: 'спрян от лимита', error: 'грешка',
   ci_failed: 'червен CI', blocked: 'блокирана', closed: 'PR затворен', 'ci-evals': 'evals в CI', over_budget: 'над тавана',
-  answered: 'отговорено', stopped: 'спряна от теб',
+  answered: 'отговорено', stopped: 'спряна от теб', feature_pr: 'PR на функционалността',
 };
 
 // The night report for Linear: one line per task, the evals in CI, the total against the cap.
@@ -215,6 +215,40 @@ export function nightReport(entries, since, nightCap) {
   }
   if (byTask.size === 0) lines.push('| - | нищо не е пускано | 0 | 0 | 0.00 | 0.00 | - |');
   return lines.join('\n');
+}
+
+// --- Delivery (INV-54): one PR per feature ---
+
+// A feature is ready for its PR to main when it has subtasks, each of them is done or canceled, and none is still
+// in the runner's queue.
+export function featureReady(children, queue, base) {
+  return children.length > 0 && children.every((c) => ['completed', 'canceled'].includes(c.state?.type)) && !queue.some((t) => t.base === base);
+}
+
+// The PR of a feature, for Yoan: what changes (the subtasks and their PRs), the risks and what to test. The reviewer
+// adds its own summary on PRs to main once it runs in CI (INV-44).
+export function featurePrBody({ feature, children, merged, repo }) {
+  const prFor = (id) => merged.find((p) => p.title.startsWith(`${id}:`));
+  const lines = [
+    '## Какво се променя', '',
+    `${feature.title} (Linear: ${feature.identifier}).`, '',
+    ...children.map((c) => {
+      const pr = prFor(c.identifier);
+      return `- ${c.identifier}: ${c.title}${c.state?.type === 'canceled' ? ' (отменена)' : pr ? ` (#${pr.number})` : ''}`;
+    }),
+    '',
+    '## Рискове', '',
+    'Всяка подзадача е минала CI поотделно и е слята във feature клона, когато е била зелена. Рисковете за целия набор ги пише reviewer-ът в CI (INV-44), щом влезе в main; дотогава ги виж в описанията на PR-ите на подзадачите.',
+    '',
+    '## Какво да тестваш', '',
+    repo === 'invoicely-agents'
+      ? '- Отчетът на evals в CI на този PR: всички агенти, които функционалността променя, минават.'
+      : '- Средата на този PR в staging (INV-19): сценариите от критериите за приемане на подзадачите.',
+    '- Зелен CI на този PR.',
+    '',
+    `Linear: ${feature.identifier}`,
+  ];
+  return `${lines.join('\n')}\n`;
 }
 
 // --- One writer for the status of the runner's tasks (INV-50) ---
