@@ -1,0 +1,24 @@
+{
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "excludedCommands": ["claude plugin eval:*"],
+    "filesystem": {
+      "denyRead": [
+        "~/.invoicely",
+        "~/.ssh",
+        "~/.config/gh",
+        "~/.aws",
+        "~/.netrc",
+        "~/.git-credentials",
+        "~/.docker",
+        "~/Library/Keychains"
+      ]
+    },
+    "network": {
+      "allowedDomains": ["github.com", "api.github.com", "*.githubusercontent.com", "registry.npmjs.org"],
+      "allowMachLookup": ["com.apple.trustd.agent", "com.apple.trustd"]
+    }
+  }
+}

@@ -5,6 +5,7 @@
 //
 //   node github-app.mjs check                 mint a token and list the repos the App can reach (prints no secret)
 //   node github-app.mjs git-credential get    git credential helper, answers for https://github.com only
+//   node github-app.mjs git-credential --token-file <file> get   the same with a token the runner wrote (INV-57)
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -128,7 +129,24 @@ export function appSettings(state = stateDir()) {
   return { ...app, pemFile: path.join(state, 'github-app.pem'), cacheFile: path.join(state, 'cache', 'github-app-token.json') };
 }
 
-async function cli(command, operation) {
+// A file only the session's own token is in, written by the runner and readable by the session (INV-57).
+export function writeTokenFile(file, token) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(`${file}.tmp`, token, { mode: 0o600 });
+  fs.renameSync(`${file}.tmp`, file);
+}
+
+async function cli(args) {
+  const [command] = args;
+  // In an agent session the helper runs inside the sandbox, which does not let it read ~/.invoicely: it answers
+  // with the one-hour token the runner put in the session's folder, and never touches the App key (INV-57).
+  const tokenAt = args.indexOf('--token-file');
+  if (command === 'git-credential' && tokenAt >= 0) {
+    const input = fs.readFileSync(0, 'utf8');
+    if (args.at(-1) === 'get') process.stdout.write(credentialAnswer(input, fs.readFileSync(args[tokenAt + 1], 'utf8').trim()));
+    return;
+  }
+  const operation = args[1];
   const app = appSettings();
   if (!app) throw new Error('githubApp is not set in ~/.invoicely/config.json');
   if (command === 'check') {
@@ -146,11 +164,11 @@ async function cli(command, operation) {
     if (operation === 'get') process.stdout.write(credentialAnswer(input, await installationToken(app)));
     return; // store and erase: nothing is kept
   }
-  throw new Error('usage: github-app.mjs check | git-credential <get|store|erase>');
+  throw new Error('usage: github-app.mjs check | git-credential [--token-file <file>] <get|store|erase>');
 }
 
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
-  cli(process.argv[2], process.argv[3]).catch((error) => {
+  cli(process.argv.slice(2)).catch((error) => {
     process.stderr.write(`github-app: ${error.message}\n`);
     process.exit(1);
   });

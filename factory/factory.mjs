@@ -17,7 +17,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { appSettings, installationToken, sessionEnv, writeGhConfig } from './github-app.mjs';
+import { appSettings, installationToken, sessionEnv, writeGhConfig, writeTokenFile } from './github-app.mjs';
 import { linearClient, mention } from './linear.mjs';
 import { answerAfter, planFromReady } from './linear-sync.mjs';
 import { cleanupSummary, oldLogs, parseWorktrees, planCleanup } from './janitor.mjs';
@@ -50,6 +50,14 @@ const config = {
   reportProjectId: 'a2abfb0c-4d55-41a7-8719-3838050c6d0c', // Linear project "M0 Инфраструктура": the night report goes there
   ...readJson(path.join(STATE, 'config.json'), {}),
 };
+// The bot token of each running agent session, outside STATE, which the sandbox does not let sessions read (INV-57).
+const SESSIONS = process.env.INVOICELY_SESSIONS || path.join(HOME, '.invoicely-session');
+// The sandbox of the agent sessions (INV-57): their Bash commands and everything those start may not read the
+// runner's state, SSH, gh, AWS, Docker or git credentials or the Keychain (checked on 25.11: without
+// ~/Library/Keychains in the list, `security` reads Keychain items from inside the sandbox), and reach only GitHub and
+// npm. trustd is for gh's TLS. `claude plugin eval` runs outside it: its claude processes need the Claude login in
+// the Keychain and /tmp. allowUnsandboxedCommands false: the model cannot ask to leave the sandbox.
+const SANDBOX = path.join(HERE, 'sandbox.json');
 const QUEUE = path.join(STATE, 'queue.json');
 const LEDGER = path.join(STATE, 'ledger', 'runs.jsonl');
 for (const dir of ['locks', 'ledger', 'logs']) fs.mkdirSync(path.join(STATE, dir), { recursive: true });
@@ -405,17 +413,27 @@ async function reportToLinear(entry, resultText) {
 
 // Agent sessions act as the GitHub App bot when it is set up: Yoan gets the notifications and approves its PRs,
 // and the bot cannot change workflows or the protection of main. Without the App they act as Yoan, as before.
-async function sessionIdentity() {
+// The bot identity. The runner's own pushes use the App key directly. An agent session (issue set) runs in the
+// sandbox, which does not let it read ~/.invoicely (INV-57): only the one-hour token leaves it, into the session's own
+// folder, where gh and the git helper read it and the sandbox lets nothing write; the folder goes when the session ends.
+// Like GITHUB_TOKEN in GitHub Actions: the job's code may use its token, never the App's key.
+async function sessionIdentity(issue = null) {
   const app = appSettings(STATE);
   if (!app) return null;
-  const ghConfigDir = path.join(STATE, 'gh-bot');
-  // Fails here, before the session, when the key or the installation is wrong.
-  writeGhConfig(ghConfigDir, await installationToken(app), app.slug);
-  const refresh = async () => writeGhConfig(ghConfigDir, await installationToken(app), app.slug);
   const script = path.join(HERE, 'github-app.mjs');
+  const dir = issue ? path.join(SESSIONS, issue) : null;
+  const ghConfigDir = dir ? path.join(dir, 'gh') : path.join(STATE, 'gh-bot');
+  const tokenFile = dir ? path.join(dir, 'git-token') : null;
+  const write = async () => {
+    const token = await installationToken(app);
+    writeGhConfig(ghConfigDir, token, app.slug);
+    if (tokenFile) writeTokenFile(tokenFile, token);
+  };
+  await write(); // fails here, before the session, when the key or the installation is wrong
   return {
-    name: `${app.slug}[bot]`, slug: app.slug, botUserId: app.botUserId, ghConfigDir, refresh,
-    helperCommand: `!'${process.execPath}' '${script}' git-credential`,
+    name: `${app.slug}[bot]`, slug: app.slug, botUserId: app.botUserId, ghConfigDir, refresh: write,
+    cleanup: () => { if (dir) fs.rmSync(dir, { recursive: true, force: true }); },
+    helperCommand: `!'${process.execPath}' '${script}' git-credential${tokenFile ? ` --token-file '${tokenFile}'` : ''}`,
   };
 }
 
@@ -448,7 +466,7 @@ async function runTask(task, budgetCap) {
     const wt = ensureWorktree(task, prBase);
     if (task.worktree !== wt) updateItem(task.issue, { worktree: wt });
     const budget = Math.min(task.budgetUsd ?? config.budgetUsd, budgetCap ?? Infinity);
-    const base = ['--plugin-dir', runtime, '--permission-mode', 'acceptEdits', '--output-format', 'json',
+    const base = ['--plugin-dir', runtime, '--settings', SANDBOX, '--permission-mode', 'acceptEdits', '--output-format', 'json',
       '--max-budget-usd', String(budget), ...(task.addDir ? ['--add-dir', task.addDir] : []), '--allowedTools', ...ALLOWED_TOOLS];
     let args;
     let newSession = null;
@@ -469,10 +487,16 @@ async function runTask(task, budgetCap) {
     const started = new Date();
     const logFile = path.join(STATE, 'logs', `${task.issue}-${started.toISOString().replace(/[:.]/g, '-')}.log`);
     log(`${task.issue}: start in ${wt}${task.resumeSession ? ` (resume ${task.resumeSession})` : ''}, cap $${budget}`);
-    const identity = await sessionIdentity();
+    const identity = await sessionIdentity(task.issue);
     log(`${task.issue}: github as ${identity ? identity.name : 'Yoan (no GitHub App in config.json)'}`);
     if (newSession) updateItem(task.issue, { resumeSession: newSession, message: INTERRUPTED, startFailures: undefined });
-    const { code, stdout } = await runClaude(args, wt, logFile, identity);
+    let ran;
+    try {
+      ran = await runClaude(args, wt, logFile, identity);
+    } finally {
+      identity?.cleanup();
+    }
+    const { code, stdout } = ran;
     const result = parseResult(stdout);
     const status = classify(result);
     const ended = new Date();
