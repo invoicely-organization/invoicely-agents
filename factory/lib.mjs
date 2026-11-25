@@ -40,6 +40,11 @@ export function sessionDirName(cwd) {
   return cwd.replace(/[^A-Za-z0-9]/g, '-');
 }
 
+// Where Claude Code keeps a session's transcript; a session without one cannot be resumed.
+export function transcriptFile(home, cwd, id) {
+  return `${home}/.claude/projects/${sessionDirName(cwd)}/${id}.jsonl`;
+}
+
 // The JSON result of `claude -p --output-format json`; plain text when Claude stopped before it.
 export function parseResult(stdout) {
   const lines = (stdout ?? '').trim().split('\n').reverse();

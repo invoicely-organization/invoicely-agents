@@ -33,7 +33,7 @@ import { linearClient, mention } from './linear.mjs';
 import { answerAfter, planFromReady } from './linear-sync.mjs';
 import {
   budgetAnswer, classify, entryCosts, fillTemplate, findingLines, fixMessage, isReviewCheck, minutesBetween, nextRunnable,
-  parseOutcome, parseResult, retryAt, reviewDecision, reviewText, servicePlist, sessionDirName, statusAction, summaryBody, taskCost,
+  parseOutcome, parseResult, retryAt, reviewDecision, reviewText, servicePlist, statusAction, summaryBody, taskCost, transcriptFile,
 } from './lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -273,7 +273,7 @@ function lock(issue) {
 // Where Claude Code's own installer puts claude (~/.local/bin, since 25.11 on this Mac), before the service's PATH.
 const SESSION_PATH = (base) => [config.nodeBin, path.join(HOME, '.local', 'bin'), base].filter(Boolean).join(':');
 
-function runClaude(args, cwd, logFile, role) {
+function runClaude(args, cwd, logFile, role, onStart = () => {}) {
   return new Promise((resolve) => {
     const env = { ...process.env };
     env.PATH = SESSION_PATH(env.PATH);
@@ -287,19 +287,27 @@ function runClaude(args, cwd, logFile, role) {
     env.INVOICELY_AGENT_SESSION = '1';
     const child = spawn('claude', args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      out.end();
+      resolve(result);
+    };
+    child.on('spawn', onStart);
     const out = fs.createWriteStream(logFile, { flags: 'a' });
     child.stdout.on('data', (chunk) => { stdout += chunk; out.write(chunk); });
     child.stderr.on('data', (chunk) => out.write(chunk));
     // claude not found or not startable: the step failed to start, the runner itself goes on (25.11: ENOENT under
     // launchd crashed the runner every minute).
-    child.on('error', (error) => { out.end(); resolve({ code: null, stdout, spawnError: error }); });
-    child.on('close', (code) => { out.end(); resolve({ code, stdout }); });
+    child.on('error', (error) => finish({ code: null, stdout, spawnError: error }));
+    child.on('close', (code) => finish({ code, stdout }));
   });
 }
 
 // A session can be resumed only when Claude Code kept its transcript; one that never started cannot.
 function sessionExists(cwd, id) {
-  return fs.existsSync(path.join(HOME, '.claude', 'projects', sessionDirName(cwd), `${id}.jsonl`));
+  return fs.existsSync(transcriptFile(HOME, cwd, id));
 }
 
 function testsLine(task) {
@@ -316,6 +324,8 @@ async function runSession(task, role, wt, budget) {
     '--output-format', 'json', '--max-budget-usd', String(budget), '--allowedTools', ...COMMON_TOOLS, ...(REPO_TOOLS[task.repo] ?? [])];
   let args;
   let id = sessions[role] && sessionExists(wt, sessions[role]) ? sessions[role] : null;
+  if (sessions[role] && !id) log(`${task.issue}: ${role} session ${sessions[role]} has no transcript, so a new session starts`);
+  const resumed = Boolean(id);
   if (id) {
     args = ['-p', task.message || CONTINUE, '--resume', id, ...base];
   } else {
@@ -328,12 +338,12 @@ async function runSession(task, role, wt, budget) {
     args = ['-p', message ? `${prompt}\n\n${message}` : prompt, '--session-id', id, ...base];
     updateItem(task.issue, { sessions: { ...sessions, [role]: id } });
   }
-  // A restart while the session runs resumes it instead of repeating the instructions.
-  updateItem(task.issue, { message: CONTINUE });
   const started = new Date();
   const logFile = path.join(STATE, 'logs', `${task.issue}-${role}-${started.toISOString().replace(/[:.]/g, '-')}.log`);
-  log(`${task.issue}: ${role} starts in ${wt}${sessions[role] ? ' (resumed)' : ''}, cap $${budget}`);
-  const { code, stdout, spawnError } = await runClaude(args, wt, logFile, role);
+  log(`${task.issue}: ${role} starts in ${wt}${resumed ? ' (resumed)' : ''}, cap $${budget}`);
+  // Once claude runs, a restart resumes the session instead of repeating the instructions. Not before: a claude that
+  // does not start leaves the step's message (findings, Yoan's answer) in the queue for the next try.
+  const { code, stdout, spawnError } = await runClaude(args, wt, logFile, role, () => updateItem(task.issue, { message: CONTINUE }));
   if (spawnError) throw new Error(`claude did not start: ${spawnError.message}`);
   const result = parseResult(stdout);
   const status = classify(result);
