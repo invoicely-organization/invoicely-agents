@@ -35,6 +35,20 @@ export function fillTemplate(template, vars) {
   return template.replace(/\{([A-Z_]+)\}/g, (whole, key) => (key in vars ? vars[key] : whole));
 }
 
+// The argv runSession passes to `claude` for a role's session: a continued one resumes `resume`, a new one gets
+// `sessionId` up front. --setting-sources project,local keeps Yoan's ~/.claude/settings.json out of the session: its
+// Read denies (node_modules, lockfiles) would otherwise become sandbox read denies and stop `pnpm install` (INV-70).
+export function sessionArgs({ role, prompt, pluginDir, sandboxFile, resume, sessionId, budget, tools = [] }) {
+  const start = resume ? ['--resume', resume] : sessionId ? ['--session-id', sessionId] : [];
+  return [
+    '-p', prompt, ...start,
+    '--agent', `invoicely-agents:${role}`, '--plugin-dir', pluginDir, '--settings', sandboxFile, '--setting-sources', 'project,local',
+    '--permission-mode', 'acceptEdits', '--output-format', 'json',
+    ...(budget == null ? [] : ['--max-budget-usd', String(budget)]),
+    ...(tools.length ? ['--allowedTools', ...tools] : []),
+  ];
+}
+
 // Claude Code keeps a project's sessions in ~/.claude/projects/<path with every non-alphanumeric as ->.
 export function sessionDirName(cwd) {
   return cwd.replace(/[^A-Za-z0-9]/g, '-');
