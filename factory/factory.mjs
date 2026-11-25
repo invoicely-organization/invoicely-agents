@@ -33,7 +33,7 @@ import { linearClient, mention } from './linear.mjs';
 import { answerAfter, planFromReady } from './linear-sync.mjs';
 import {
   budgetAnswer, classify, entryCosts, fillTemplate, findingLines, fixMessage, isReviewCheck, minutesBetween, nextRunnable,
-  parseOutcome, parseResult, retryAt, reviewDecision, reviewText, servicePlist, statusAction, summaryBody, taskCost,
+  parseOutcome, parseResult, retryAt, reviewDecision, reviewText, servicePlist, sessionDirName, statusAction, summaryBody, taskCost,
 } from './lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -270,10 +270,13 @@ function lock(issue) {
   return () => fs.rmSync(file, { force: true });
 }
 
+// Where Claude Code's own installer puts claude (~/.local/bin, since 25.11 on this Mac), before the service's PATH.
+const SESSION_PATH = (base) => [config.nodeBin, path.join(HOME, '.local', 'bin'), base].filter(Boolean).join(':');
+
 function runClaude(args, cwd, logFile, role) {
   return new Promise((resolve) => {
     const env = { ...process.env };
-    if (config.nodeBin) env.PATH = `${config.nodeBin}:${env.PATH}`;
+    env.PATH = SESSION_PATH(env.PATH);
     // The session works without any GitHub identity: the runner pushes and opens the PR.
     for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN']) delete env[key];
     // The role guard reads the role from here, for the whole session and its subagents.
@@ -287,8 +290,16 @@ function runClaude(args, cwd, logFile, role) {
     const out = fs.createWriteStream(logFile, { flags: 'a' });
     child.stdout.on('data', (chunk) => { stdout += chunk; out.write(chunk); });
     child.stderr.on('data', (chunk) => out.write(chunk));
+    // claude not found or not startable: the step failed to start, the runner itself goes on (25.11: ENOENT under
+    // launchd crashed the runner every minute).
+    child.on('error', (error) => { out.end(); resolve({ code: null, stdout, spawnError: error }); });
     child.on('close', (code) => { out.end(); resolve({ code, stdout }); });
   });
+}
+
+// A session can be resumed only when Claude Code kept its transcript; one that never started cannot.
+function sessionExists(cwd, id) {
+  return fs.existsSync(path.join(HOME, '.claude', 'projects', sessionDirName(cwd), `${id}.jsonl`));
 }
 
 function testsLine(task) {
@@ -304,7 +315,7 @@ async function runSession(task, role, wt, budget) {
   const base = ['--agent', `invoicely-agents:${role}`, '--plugin-dir', runtime, '--settings', SANDBOX, '--permission-mode', 'acceptEdits',
     '--output-format', 'json', '--max-budget-usd', String(budget), '--allowedTools', ...COMMON_TOOLS, ...(REPO_TOOLS[task.repo] ?? [])];
   let args;
-  let id = sessions[role];
+  let id = sessions[role] && sessionExists(wt, sessions[role]) ? sessions[role] : null;
   if (id) {
     args = ['-p', task.message || CONTINUE, '--resume', id, ...base];
   } else {
@@ -313,7 +324,8 @@ async function runSession(task, role, wt, budget) {
     const prompt = fillTemplate(fs.readFileSync(path.join(HERE, 'prompts', `${role}.md`), 'utf8'), {
       ISSUE: task.issue, TASK: fs.readFileSync(task.brief, 'utf8').trim(), WT: wt, REPO: task.repo, BRANCH: task.branch, TESTS: testsLine(task),
     });
-    args = ['-p', task.message ? `${prompt}\n\n${task.message}` : prompt, '--session-id', id, ...base];
+    const message = task.message && task.message !== CONTINUE ? task.message : '';
+    args = ['-p', message ? `${prompt}\n\n${message}` : prompt, '--session-id', id, ...base];
     updateItem(task.issue, { sessions: { ...sessions, [role]: id } });
   }
   // A restart while the session runs resumes it instead of repeating the instructions.
@@ -321,7 +333,8 @@ async function runSession(task, role, wt, budget) {
   const started = new Date();
   const logFile = path.join(STATE, 'logs', `${task.issue}-${role}-${started.toISOString().replace(/[:.]/g, '-')}.log`);
   log(`${task.issue}: ${role} starts in ${wt}${sessions[role] ? ' (resumed)' : ''}, cap $${budget}`);
-  const { code, stdout } = await runClaude(args, wt, logFile, role);
+  const { code, stdout, spawnError } = await runClaude(args, wt, logFile, role);
+  if (spawnError) throw new Error(`claude did not start: ${spawnError.message}`);
   const result = parseResult(stdout);
   const status = classify(result);
   const ended = new Date();
@@ -1111,7 +1124,7 @@ function service(sub) {
     fs.mkdirSync(path.dirname(plistFile), { recursive: true });
     fs.writeFileSync(plistFile, servicePlist({
       label: LABEL, node: path.join(nodeBin, 'node'), script: path.join(AGENTS_REPO, 'factory', 'factory.mjs'), cwd: AGENTS_REPO,
-      logFile: path.join(STATE, 'logs', 'runner.log'), pathEnv: `${nodeBin}:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`, home: HOME,
+      logFile: path.join(STATE, 'logs', 'runner.log'), pathEnv: `${nodeBin}:${path.join(HOME, '.local', 'bin')}:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`, home: HOME,
     }));
     execFileSync('launchctl', ['bootstrap', domain, plistFile], { stdio: 'inherit' });
     return console.log(`installed ${plistFile}; the runner runs as ${LABEL}`);
