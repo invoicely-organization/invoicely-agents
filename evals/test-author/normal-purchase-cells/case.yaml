@@ -1,0 +1,47 @@
+schema_version: "1.0"
+name: test-author-normal-purchase-cells
+description: Criteria and an etalon become one failing test per criterion, named after it, with expected values from the criterion or the etalon.
+tags: [test-author, normal]
+context:
+  scaffold_script: fixture.sh
+execution:
+  prompt: |
+    Use the invoicely-agents:test-author agent on the brief in brief.md and let it work in this repo. Do not write any files yourself.
+
+    When the agent is done, report what it wrote and repeat any question it asks word for word.
+  max_turns: 30
+  timeout_seconds: 900
+  allowed_tools: [Agent, Read, Glob, Grep, Write, Edit]
+runs: 3
+graders:
+  - type: tool_used
+    name: dispatched
+    tool: Agent
+    input_match: '"subagent_type"\s*:\s*"(?:invoicely-agents:)?test-author"'
+  - type: file_exists
+    name: test-file-created
+    path: packages/domain/src/vat/purchase-cells.test.ts
+  - type: regex
+    name: imports-the-contract
+    target: {source: file, path: packages/domain/src/vat/purchase-cells.test.ts}
+    pattern: 'import\s*\{[^}]*\bpurchaseCells\b[^}]*\}\s*from\s*[''"]\./purchase-cells(\.ts)?[''"]'
+  - type: regex
+    name: criterion-1-value
+    target: {source: file, path: packages/domain/src/vat/purchase-cells.test.ts}
+    pattern: '\b48000\b'
+  - type: regex
+    name: implementation-untouched
+    target: {source: file, path: packages/domain/src/vat/purchase-cells.ts}
+    pattern: "throw new Error\\('not implemented'\\);"
+  - type: llm
+    name: one-test-per-criterion
+    focus: {source: file, path: packages/domain/src/vat/purchase-cells.test.ts}
+    criteria: >
+      The brief has three criteria: (1) a purchase without tax credit, base 40000 and VAT 8000, gives cell 30 = 48000
+      and cells 31 and 41 = 0; (2) a purchase with full tax credit puts its base in cell 31 and its VAT in cell 41;
+      (3) the October 2026 etalon fixtures/etalons/vat/2026-10-purchases.json gives cell 30 = 48000, cell 31 = 133049,
+      cell 41 = 26610. PASS if this test file has at least one test for each of the three criteria, each test name
+      refers to its criterion (by number or by its words), and every expected value is a literal matching the
+      criterion or the etalon, or is read from the etalon's "expected" block. FAIL if a criterion has no test, if an
+      expected value differs from the criterion or the etalon, or if an expected value is computed in the test by
+      summing or filtering the input lines.

@@ -1,0 +1,58 @@
+schema_version: "1.0"
+name: test-author-incomplete-missing-etalon
+description: When the etalon a criterion needs is missing, the agent writes the tests it can derive, leaves that criterion as a todo without invented numbers, and asks for the etalon with a proposed answer.
+tags: [test-author, incomplete]
+context:
+  scaffold_script: fixture.sh
+execution:
+  prompt: |
+    Use the invoicely-agents:test-author agent on the brief in brief.md and let it work in this repo. Do not write any files yourself.
+
+    When the agent is done, report what it wrote and repeat any question it asks word for word.
+  max_turns: 30
+  timeout_seconds: 900
+  allowed_tools: [Agent, Read, Glob, Grep, Write, Edit]
+runs: 3
+graders:
+  - type: tool_used
+    name: dispatched
+    tool: Agent
+    input_match: '"subagent_type"\s*:\s*"(?:invoicely-agents:)?test-author"'
+  - type: file_exists
+    name: test-file-created
+    path: packages/domain/src/vat/purchase-cells.test.ts
+  - type: regex
+    name: criterion-1-value
+    target: {source: file, path: packages/domain/src/vat/purchase-cells.test.ts}
+    pattern: '\b18000\b'
+  - type: regex
+    name: no-etalon-written
+    target: files
+    pattern: 'fixtures/etalons/'
+    match: not_contains
+  - type: regex
+    name: no-other-month-etalon
+    target: {source: file, path: packages/domain/src/vat/purchase-cells.test.ts}
+    pattern: '[''"`][^''"`\n]*2026-1[01]-purchases\.json[''"`]'
+    match: not_contains
+  - type: llm
+    name: criterion-3-left-open
+    focus: {source: file, path: packages/domain/src/vat/purchase-cells.test.ts}
+    criteria: >
+      The brief has three criteria: (1) a purchase without tax credit, base 15000 and VAT 3000, gives cell 30 = 18000
+      and cells 31 and 41 = 0; (2) a purchase with full tax credit, base 62550 and VAT 12510, gives cell 31 = 62550,
+      cell 41 = 12510 and cell 30 = 0; (3) cells 30, 31 and 41 equal the expected cells of the December 2026 etalon
+      fixtures/etalons/vat/2026-12-purchases.json, a file that does not exist yet. PASS if criteria 1 and 2 each have
+      a test named after its criterion (by number or by its words) that asserts the values above, and criterion 3 is
+      left open as a todo (test.todo, or a test with the todo or skip option) that names criterion 3 and asserts no
+      number. FAIL if criterion 1 or 2 has no test or expects other values, if the file asserts any concrete cell value
+      for criterion 3, takes criterion 3's expected cells from another month's etalon or from adding up lines, or
+      has a running test for criterion 3 that would fail only because the etalon file is missing (the implementer
+      could never make that locked test pass).
+  - type: llm
+    name: asks-for-the-etalon
+    criteria: >
+      PASS if the report says criterion 3 has no real test yet because fixtures/etalons/vat/2026-12-purchases.json is
+      missing, asks for that etalon (or for the December expected cells), and proposes an answer, for example that
+      Konstantin adds the etalon and test-author then replaces the todo with a test. FAIL if it says every criterion
+      is fully covered, if it gives December cell values of its own, or if it asks without proposing an answer.
