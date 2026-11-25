@@ -92,6 +92,12 @@ export function blockingDeps(task, merged) {
   return (task.dependsOn ?? []).filter((dep) => !merged.has(dep));
 }
 
+// A PR whose one problem is a conflict with its base: the runner tries its own merge before an agent is woken up
+// (factory/update-branch.mjs).
+export function conflictOnly(failed) {
+  return Array.isArray(failed) && failed.length > 0 && failed.every((f) => f.startsWith('merge conflict'));
+}
+
 export function fixMessage({ pr, failed, branch, base }) {
   const conflict = failed.some((f) => f.startsWith('merge conflict'));
   const review = failed.includes('review');
@@ -113,6 +119,15 @@ export function fixMessage({ pr, failed, branch, base }) {
 // is woken up for a fix round (INV-53).
 export function shouldRerunEvals(failed, item) {
   return Array.isArray(failed) && failed.length === 1 && failed[0] === 'evals' && !item.evalReruns;
+}
+
+// What a queued fix round does when the runner looks at its PR again just before the session (INV-60): 'ci' when
+// the PR no longer fails (fixed meanwhile, or CI runs again), 'rerun-evals' when only the evals fail and they were
+// not run again yet, otherwise 'run' with the failures as they are now.
+export function fixPrecheck(result, item) {
+  if (result?.verdict !== 'fail') return 'ci';
+  if (shouldRerunEvals(result.failed, item)) return 'rerun-evals';
+  return 'run';
 }
 
 // Pick the next task to run: the first one that is not waiting for CI and whose dependencies are merged

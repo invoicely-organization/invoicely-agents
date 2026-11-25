@@ -17,12 +17,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { appSettings, installationToken, sessionEnv, writeGhConfig } from './github-app.mjs';
+import { appSettings, installationToken, sessionEnv, writeGhConfig, writeTokenFile } from './github-app.mjs';
 import { linearClient, mention } from './linear.mjs';
 import { answerAfter, planFromReady } from './linear-sync.mjs';
 import { cleanupSummary, oldLogs, parseWorktrees, planCleanup } from './janitor.mjs';
+import { alreadyUpdated, copyMatchesPr, mergeBaseInto } from './update-branch.mjs';
 import {
-  blockingDeps, checksVerdict, classify, failedChecks, fillTemplate, findPrUrl, fixMessage, inWindow, isFeatureBranch,
+  blockingDeps, checksVerdict, classify, conflictOnly, failedChecks, fixPrecheck, fillTemplate, findPrUrl, fixMessage, inWindow, isFeatureBranch,
   budgetAnswer, entryCosts, featurePrBody, featureReady, minutesBetween, nextRunnable, nextWindowStart, nightReport, nightStart, parseLimitReset, parseResult,
   servicePlist, sessionBudget, sessionDirName, shouldRerunEvals, spendingPeriod, spentSince, statusAction, taskSpent,
 } from './lib.mjs';
@@ -49,6 +50,14 @@ const config = {
   reportProjectId: 'a2abfb0c-4d55-41a7-8719-3838050c6d0c', // Linear project "M0 Инфраструктура": the night report goes there
   ...readJson(path.join(STATE, 'config.json'), {}),
 };
+// The bot token of each running agent session, outside STATE, which the sandbox does not let sessions read (INV-57).
+const SESSIONS = process.env.INVOICELY_SESSIONS || path.join(HOME, '.invoicely-session');
+// The sandbox of the agent sessions (INV-57): their Bash commands and everything those start may not read the
+// runner's state, SSH, gh, AWS, Docker or git credentials or the Keychain (checked on 25.11: without
+// ~/Library/Keychains in the list, `security` reads Keychain items from inside the sandbox), and reach only GitHub and
+// npm. trustd is for gh's TLS. `claude plugin eval` runs outside it: its claude processes need the Claude login in
+// the Keychain and /tmp. allowUnsandboxedCommands false: the model cannot ask to leave the sandbox.
+const SANDBOX = path.join(HERE, 'sandbox.json');
 const QUEUE = path.join(STATE, 'queue.json');
 const LEDGER = path.join(STATE, 'ledger', 'runs.jsonl');
 for (const dir of ['locks', 'ledger', 'logs']) fs.mkdirSync(path.join(STATE, dir), { recursive: true });
@@ -215,6 +224,67 @@ async function advanceCi(item) {
   return { verdict: 'merged' };
 }
 
+// A conflict only in union files (policies/role-guard.yaml) is the runner's to fix: it merges the base into the task's
+// copy as the bot and pushes, with no session and no fix round (factory/update-branch.mjs). Returns { merged } or
+// { pending } when GitHub has not yet seen an earlier fixing push, or { why } when the agent has to do it.
+async function updateBranch(item) {
+  const wt = taskCopyPath(item);
+  if (!fs.existsSync(wt)) return { why: 'the task has no copy on disk' };
+  git(wt, ['fetch', '-q', 'origin']);
+  if (alreadyUpdated({ cwd: wt, base: item.base, branch: item.branch })) return { pending: true };
+  if (!copyMatchesPr({ cwd: wt, branch: item.branch })) return { why: 'the copy is not the PR\'s head' };
+  const identity = await sessionIdentity();
+  const env = identity ? sessionEnv({ ...process.env }, identity) : { ...process.env };
+  const result = mergeBaseInto({
+    cwd: wt, ref: `origin/${item.base}`, attributesFile: path.join(config.repo, '.gitattributes'), env,
+    message: `${item.issue}: merge ${item.base} (by the runner: the only conflict was in union files)`,
+  });
+  if (!result.merged) return { why: result.why };
+  execFileSync('git', ['push', '-q', 'origin', `HEAD:${item.branch}`], { cwd: wt, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  return { merged: true };
+}
+
+async function tryUpdateBranch(item) {
+  const up = await updateBranch(item).catch((error) => ({ why: error.message.split('\n')[0] }));
+  if (up.merged) log(`${item.issue}: merged ${item.base} into ${item.branch} itself (only union files conflicted); CI runs again`);
+  else if (!up.pending) log(`${item.issue}: cannot merge ${item.base} itself (${up.why}); the agent gets the fix round`);
+  return up;
+}
+
+// A fix round waits for the night, and by then its PR may be fixed (by Yoan, by Claude, by the runner's own merge)
+// or green after a rerun. The runner looks again before it wakes the agent, like a job that checks its precondition
+// when it starts instead of when it was queued. Returns false when the session is not needed.
+async function fixStillNeeded(task) {
+  let result;
+  try {
+    result = await advanceCi(task);
+  } catch (error) {
+    log(`${task.issue}: ci: ${error.message}`);
+    return true;
+  }
+  if (result.verdict === 'fail' && conflictOnly(result.failed)) {
+    const up = await tryUpdateBranch(task);
+    if (up.merged || up.pending) result = { verdict: 'pending' };
+  }
+  const backToCi = (extra, why) => {
+    updateItem(task.issue, {
+      stage: 'ci', ciSince: new Date().toISOString(), fixRounds: Math.max(0, (task.fixRounds ?? 1) - 1),
+      session: task.session ?? task.resumeSession, resumeSession: undefined, message: undefined, ...extra,
+    });
+    log(`${task.issue}: ${why}, so no fix session: back to waiting for CI`);
+    return false;
+  };
+  const next = fixPrecheck(result, task);
+  if (next === 'ci') return backToCi({}, `its PR no longer fails (${result.verdict})`);
+  // It still fails, maybe for another reason than when the round was queued (on 25.11 PR #20: a conflict then,
+  // other agents' evals now). The same rules as in processCi: evals alone are run once more first, and the agent
+  // gets the failures as they are now, not the old message.
+  if (next === 'rerun-evals' && (await rerunFailedJobs(task))) return backToCi({ evalReruns: 1 }, 'only the evals fail and CI runs them once more');
+  task.message = fixMessage({ pr: task.pr, failed: result.failed, branch: task.branch, base: task.base });
+  updateItem(task.issue, { message: task.message });
+  return true;
+}
+
 // Runs the failed jobs of the PR's last CI run again: as the bot, or as Yoan when the App may not (INV-53).
 async function rerunFailedJobs(item) {
   try {
@@ -353,17 +423,27 @@ async function reportToLinear(entry, resultText) {
 
 // Agent sessions act as the GitHub App bot when it is set up: Yoan gets the notifications and approves its PRs,
 // and the bot cannot change workflows or the protection of main. Without the App they act as Yoan, as before.
-async function sessionIdentity() {
+// The bot identity. The runner's own pushes use the App key directly. An agent session (issue set) runs in the
+// sandbox, which does not let it read ~/.invoicely (INV-57): only the one-hour token leaves it, into the session's own
+// folder, where gh and the git helper read it and the sandbox lets nothing write; the folder goes when the session ends.
+// Like GITHUB_TOKEN in GitHub Actions: the job's code may use its token, never the App's key.
+async function sessionIdentity(issue = null) {
   const app = appSettings(STATE);
   if (!app) return null;
-  const ghConfigDir = path.join(STATE, 'gh-bot');
-  // Fails here, before the session, when the key or the installation is wrong.
-  writeGhConfig(ghConfigDir, await installationToken(app), app.slug);
-  const refresh = async () => writeGhConfig(ghConfigDir, await installationToken(app), app.slug);
   const script = path.join(HERE, 'github-app.mjs');
+  const dir = issue ? path.join(SESSIONS, issue) : null;
+  const ghConfigDir = dir ? path.join(dir, 'gh') : path.join(STATE, 'gh-bot');
+  const tokenFile = dir ? path.join(dir, 'git-token') : null;
+  const write = async () => {
+    const token = await installationToken(app);
+    writeGhConfig(ghConfigDir, token, app.slug);
+    if (tokenFile) writeTokenFile(tokenFile, token);
+  };
+  await write(); // fails here, before the session, when the key or the installation is wrong
   return {
-    name: `${app.slug}[bot]`, slug: app.slug, botUserId: app.botUserId, ghConfigDir, refresh,
-    helperCommand: `!'${process.execPath}' '${script}' git-credential`,
+    name: `${app.slug}[bot]`, slug: app.slug, botUserId: app.botUserId, ghConfigDir, refresh: write,
+    cleanup: () => { if (dir) fs.rmSync(dir, { recursive: true, force: true }); },
+    helperCommand: `!'${process.execPath}' '${script}' git-credential${tokenFile ? ` --token-file '${tokenFile}'` : ''}`,
   };
 }
 
@@ -396,7 +476,7 @@ async function runTask(task, budgetCap) {
     const wt = ensureWorktree(task, prBase);
     if (task.worktree !== wt) updateItem(task.issue, { worktree: wt });
     const budget = Math.min(task.budgetUsd ?? config.budgetUsd, budgetCap ?? Infinity);
-    const base = ['--plugin-dir', runtime, '--permission-mode', 'acceptEdits', '--output-format', 'json',
+    const base = ['--plugin-dir', runtime, '--settings', SANDBOX, '--permission-mode', 'acceptEdits', '--output-format', 'json',
       '--max-budget-usd', String(budget), ...(task.addDir ? ['--add-dir', task.addDir] : []), '--allowedTools', ...ALLOWED_TOOLS];
     let args;
     let newSession = null;
@@ -417,10 +497,16 @@ async function runTask(task, budgetCap) {
     const started = new Date();
     const logFile = path.join(STATE, 'logs', `${task.issue}-${started.toISOString().replace(/[:.]/g, '-')}.log`);
     log(`${task.issue}: start in ${wt}${task.resumeSession ? ` (resume ${task.resumeSession})` : ''}, cap $${budget}`);
-    const identity = await sessionIdentity();
+    const identity = await sessionIdentity(task.issue);
     log(`${task.issue}: github as ${identity ? identity.name : 'Yoan (no GitHub App in config.json)'}`);
     if (newSession) updateItem(task.issue, { resumeSession: newSession, message: INTERRUPTED, startFailures: undefined });
-    const { code, stdout } = await runClaude(args, wt, logFile, identity);
+    let ran;
+    try {
+      ran = await runClaude(args, wt, logFile, identity);
+    } finally {
+      identity?.cleanup();
+    }
+    const { code, stdout } = ran;
     const result = parseResult(stdout);
     const status = classify(result);
     const ended = new Date();
@@ -572,9 +658,19 @@ async function processCi() {
       ledger(entry);
       updateItem(item.issue, null);
       log(`${item.issue}: ${entry.status} ${item.pr}`);
-      if (entry.status === 'merged') await reportToLinear(entry, '');
+      if (entry.status === 'merged') {
+        // The runner is the one writer of its tasks' statuses (INV-50, INV-61): Done when merged, also into a feature
+        // branch, so that Linear's own GitHub rules can be off for feature/ and stop closing the feature (INV-10, 25.11).
+        await setState(item.issue, 'Done');
+        await reportToLinear(entry, '');
+      }
       await cleanup({ only: item.branch }); // the task's copy and branch go with it (INV-48)
       continue;
+    }
+    if (result.verdict === 'fail' && conflictOnly(result.failed)) {
+      const up = await tryUpdateBranch(item);
+      if (up.merged) updateItem(item.issue, { ciSince: new Date().toISOString() });
+      if (up.merged || up.pending) continue;
     }
     if (result.verdict === 'fail' && shouldRerunEvals(result.failed, item) && (await rerunFailedJobs(item))) {
       updateItem(item.issue, { evalReruns: 1, ciSince: new Date().toISOString() });
@@ -1055,6 +1151,8 @@ async function runQueue(now) {
       await sleep((waitingForCi ? 2 : 5) * 60 * 1000);
       continue;
     }
+    // Checked at any hour, like CI: a PR fixed by day goes back to waiting for CI and is merged by day.
+    if (task.pr && task.fixRounds && task.message && !(await fixStillNeeded(task))) continue;
     if (!now && !inWindow(new Date(), config.windowStart, config.windowEnd)) {
       await reportNight(`Нощта свърши. В опашката остават: ${queue.map((t) => `${t.issue}${t.stage === 'ci' ? ' (чака CI)' : ''}`).join(', ')}.`);
       // By day: no sessions, but CI, merges and Linear (answers, tasks in Ready) are still followed every 5 minutes.

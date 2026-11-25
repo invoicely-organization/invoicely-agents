@@ -118,20 +118,21 @@ jobs:
           echo "agents=$agents" >> "$GITHUB_OUTPUT"
           echo "Agents to evaluate: ${agents:-none}"
       # The evals run Claude on the Max plan, so they are rationed: once per case on a subtask PR into a
-      # feature branch, three times only on the PR into main that Yoan approves.
+      # feature branch, three times only on the PR into main that Yoan approves. A case without a majority of
+      # passing runs is run again until it has three and passes with two (INV-62). The script is taken from the
+      # PR's base when the base has it, so a PR cannot change its own verdict.
       - name: Run the evals
         if: steps.pick.outputs.agents != ''
         env:
           RUNS: ${{ github.base_ref == 'main' && '3' || '1' }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          status=0
-          for agent in ${{ steps.pick.outputs.agents }}; do
-            echo "::group::$agent ($RUNS run per case)"
-            claude plugin eval . --trust-plugin --scaffold --allow-tools Write Edit \
-              --ablation none --runs "$RUNS" -j 3 --threshold 0.8 --no-publish --tag "$agent" || status=1
-            echo "::endgroup::"
-          done
-          exit $status
+          script=scripts/run-evals.mjs
+          if [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA:scripts/run-evals.mjs" 2>/dev/null; then
+            git show "$BASE_SHA:scripts/run-evals.mjs" > "$RUNNER_TEMP/run-evals.mjs"
+            script="$RUNNER_TEMP/run-evals.mjs"
+          fi
+          node "$script" --runs "$RUNS" ${{ steps.pick.outputs.agents }}
       - name: Eval cost
         if: always() && steps.pick.outputs.agents != ''
         run: node scripts/eval-cost.mjs evals/results >> "$GITHUB_STEP_SUMMARY"
