@@ -624,7 +624,12 @@ async function processCi() {
       ledger(entry);
       updateItem(item.issue, null);
       log(`${item.issue}: ${entry.status} ${item.pr}`);
-      if (entry.status === 'merged') await reportToLinear(entry, '');
+      if (entry.status === 'merged') {
+        // The runner is the one writer of its tasks' statuses (INV-50, INV-61): Done when merged, also into a feature
+        // branch, so that Linear's own GitHub rules can be off for feature/ and stop closing the feature (INV-10, 25.11).
+        await setState(item.issue, 'Done');
+        await reportToLinear(entry, '');
+      }
       await cleanup({ only: item.branch }); // the task's copy and branch go with it (INV-48)
       continue;
     }
