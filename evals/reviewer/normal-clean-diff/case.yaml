@@ -1,0 +1,35 @@
+schema_version: "1.0"
+name: reviewer-normal-clean-diff
+description: A diff that meets every acceptance criterion (services to a German business client go to cell 17) gets PASS.
+tags: [reviewer, normal]
+context:
+  scaffold_script: fixture.sh
+execution:
+  prompt: |
+    Use the invoicely-agents:reviewer agent to review the task in this workspace. Tell it that the brief is brief.md, the diff is diff.patch, and the changed files are in the workspace as they are after the change. Do not review it yourself.
+
+    When the agent answers, report its answer verbatim.
+  max_turns: 20
+  timeout_seconds: 600
+  allowed_tools: [Agent, Read, Glob, Grep]
+runs: 3
+graders:
+  - type: tool_used
+    name: dispatched
+    tool: Agent
+    input_match: '"subagent_type"\s*:\s*"(?:invoicely-agents:)?reviewer"'
+  - type: regex
+    name: verdict-pass
+    target: last_message
+    pattern: 'Verdict\W{0,4}PASS\b'
+  - type: regex
+    name: no-fail-or-question
+    target: last_message
+    pattern: 'Verdict\W{0,4}(FAIL|QUESTION)\b'
+    match: not_contains
+  # Fails when a lower severity is listed above a higher one (blocking, critical, warning, info).
+  - type: regex
+    name: findings-in-severity-order
+    target: last_message
+    pattern: '\n[ \t]*[-*][ \t]*\**[ \t]*(?:(?:warning|info)\b[\s\S]*\n[ \t]*[-*][ \t]*\**[ \t]*(?:blocking|critical)|info\b[\s\S]*\n[ \t]*[-*][ \t]*\**[ \t]*warning|critical\b[\s\S]*\n[ \t]*[-*][ \t]*\**[ \t]*blocking)\b'
+    match: not_contains
