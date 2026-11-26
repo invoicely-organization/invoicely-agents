@@ -302,6 +302,21 @@ export function statusAction(task, state) {
   return { action: 'none' };
 }
 
+// --- A stopped task put back in Ready (INV-73) ---
+
+// A task Yoan stopped goes on where it stopped only when its copy is still on disk and its PR, if it has one, is
+// open; otherwise it starts over as a new task. prState is gh's state of stopped.pr, or null when it has no PR.
+export function stoppedTaskPlan({ stopped, copyExists, prState }) {
+  if (!copyExists) return 'restart';
+  if (stopped.pr && prState !== 'OPEN') return 'restart';
+  return 'resume';
+}
+
+// The queue entry of a new task: stage tests, no sessions, nothing from an earlier run.
+export function newQueueEntry(task, { branch, brief, since }) {
+  return { ...task, branch, brief, stage: 'tests', since, sessions: {} };
+}
+
 // --- The runner as a launchd service (INV-49) ---
 
 const xml = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');

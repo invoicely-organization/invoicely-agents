@@ -33,8 +33,9 @@ import { cleanupSummary, oldLogs, parseWorktrees, planCleanup } from './janitor.
 import { linearClient, mention } from './linear.mjs';
 import { answerAfter, planFromReady } from './linear-sync.mjs';
 import {
-  budgetAnswer, classify, entryCosts, fillTemplate, findingLines, fixMessage, isReviewCheck, minutesBetween, nextRunnable,
-  parseOutcome, parseResult, retryAt, reviewDecision, reviewText, servicePlist, sessionArgs, statusAction, summaryBody, taskCost, transcriptFile,
+  budgetAnswer, classify, entryCosts, fillTemplate, findingLines, fixMessage, isReviewCheck, minutesBetween, newQueueEntry, nextRunnable,
+  parseOutcome, parseResult, retryAt, reviewDecision, reviewText, servicePlist, sessionArgs, statusAction, stoppedTaskPlan, summaryBody, taskCost,
+  transcriptFile,
 } from './lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -868,14 +869,29 @@ async function takeReady() {
       logOnce(`repo:${task.issue}`, `linear: ${task.issue} is for ${task.repo}, which is not on this Mac`);
       continue;
     }
-    // A task Yoan stopped (Backlog, Canceled) and put back in Ready goes on where it stopped.
+    // A task Yoan stopped (Backlog, Canceled) and put back in Ready goes on where it stopped, if its copy is still on
+    // disk and its PR, if any, is open (INV-73); otherwise it starts over below, as a new task.
     const last = [...entries].reverse().find((e) => e.issue === task.issue && ['stopped', 'merged', 'closed'].includes(e.status));
+    let plan = null;
     if (last?.status === 'stopped' && last.task) {
+      let prState = null;
+      if (last.task.pr) {
+        try {
+          prState = (await gh(['pr', 'view', last.task.pr, '--json', 'state'], { json: true, cwd: repoDir(last.task) })).state;
+        } catch (error) {
+          logOnce(`pr:${task.issue}`, `linear: ${task.issue} stays in Ready, its PR state is unknown: ${error.message.split('\n')[0]}`);
+          continue;
+        }
+      }
+      plan = stoppedTaskPlan({ stopped: last.task, copyExists: fs.existsSync(copyPath(last.task)), prState });
+    }
+    if (plan === 'resume') {
       writeQueue([...readQueue(), { ...last.task, ...(['tests', 'tests-fix', 'code', 'fix'].includes(last.task.stage) ? { message: last.task.message ?? CONTINUE } : {}) }]);
       await setState(task.issue, last.task.stage === 'review' ? 'In Review' : 'In Progress');
       log(`linear: ${task.issue} goes on at ${last.task.stage}`);
       continue;
     }
+    if (plan === 'restart') log(`linear: ${task.issue} starts over: its copy is gone or its PR is not open`);
     // No acceptance criteria, no session (INV-71): the task goes to Yoan and starts over when he puts it back in Ready.
     const gate = sessionGate({ text });
     if (gate.action === 'ask') {
@@ -885,7 +901,7 @@ async function takeReady() {
     const brief = path.join(STATE, 'briefs', `${task.issue}.md`);
     fs.writeFileSync(brief, text);
     const branch = freeBranch(task);
-    writeQueue([...readQueue(), { ...task, branch, brief, stage: 'tests', since: new Date().toISOString(), sessions: {} }]);
+    writeQueue([...readQueue(), newQueueEntry(task, { branch, brief, since: new Date().toISOString() })]);
     await setState(task.issue, 'In Progress');
     log(`linear: queued ${task.issue} (${task.repo}${task.ui ? ', UI' : ''}) on ${branch}`);
   }
